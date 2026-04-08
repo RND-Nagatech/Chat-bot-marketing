@@ -1,0 +1,18 @@
+node_modules/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime logs
+logs/
+*.log
+
+# WhatsApp auth/session (local only)
+auth_info/
+auth_info_debug/
+auth_info_debug2/
+
+# OS artifacts
+.DS_Store

@@ -1,0 +1,32 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Dependencies
+**/node_modules/
+
+# Environment / secrets
+**/.env
+**/.env.*
+!**/.env.example
+
+# Build outputs
+**/dist/
+**/dist-ssr/
+**/coverage/
+**/.cache/
+
+# Logs
+**/logs/
+**/*.log
+
+# Backend WhatsApp auth/session local state
+be/auth_info/
+be/auth_info_debug/
+be/auth_info_debug2/
+
+# Misc local artifacts
+*.local
