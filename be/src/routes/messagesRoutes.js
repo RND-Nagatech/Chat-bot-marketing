@@ -9,6 +9,7 @@ router.get('/', messagesController.getAllMessages);
 router.get('/conversations', messagesController.getConversations);
 router.get('/conversations/:phone', messagesController.getConversationByPhone);
 router.post('/reply', messagesController.sendManualReply);
+router.post('/reply-image', messagesController.imageUploadMiddleware, messagesController.sendManualImageReply);
 router.post('/edit', messagesController.editMessage);
 router.post('/resolve-pending', messagesController.resolvePendingMessage);
 router.post('/delete-for-me', messagesController.deleteMessageForMe);

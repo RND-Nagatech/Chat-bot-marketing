@@ -2,11 +2,16 @@
 
 Panduan singkat untuk menjalankan backend (BE) dan frontend (FE) di local.
 
+## Dokumentasi Fitur
+
+- [Fitur LLM Knowledge RAG](./README_LLM_RAG.md) - panduan fungsi, cara kerja, konfigurasi LM Studio, dan penggunaan menu Knowledge.
+
 ## Prasyarat
 
 - Node.js 16+
 - npm
 - MongoDB lokal atau MongoDB Atlas
+- LM Studio, jika ingin memakai fitur LLM/RAG
 
 ## 1) Jalankan Backend (BE)
 
@@ -33,6 +38,17 @@ JWT_SECRET=change-this-secret
 JWT_EXPIRES_IN=7d
 AUTO_CONNECT_WHATSAPP=false
 LOG_LEVEL=info
+AI_RAG_ENABLED=false
+LM_STUDIO_BASE_URL=http://localhost:1234/v1
+LM_STUDIO_CHAT_MODEL=local-model
+LM_STUDIO_EMBEDDING_MODEL=local-model
+RAG_MEMORY_MESSAGES=8
+KNOWLEDGE_OCR_ENABLED=true
+KNOWLEDGE_OCR_LANG=eng
+WA_IMAGE_OCR_ENABLED=true
+WA_IMAGE_SAVE_TO_KNOWLEDGE=true
+CHAT_HISTORY_RETENTION_DAYS=30
+CHAT_THREAD_LIMIT=200
 ```
 
 Jalankan backend:

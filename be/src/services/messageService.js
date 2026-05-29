@@ -1,6 +1,7 @@
 const Message = require('../models/Message');
 const mongoose = require('mongoose');
 const rulesEngine = require('./rulesEngine');
+const ragService = require('./ragService');
 const logger = require('../utils/logger');
 
 class MessageService {
@@ -37,6 +38,58 @@ class MessageService {
     return Math.floor(minutes * 60);
   }
 
+  getHistoryRetentionDays() {
+    const configured = Number(process.env.CHAT_HISTORY_RETENTION_DAYS);
+    return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 30;
+  }
+
+  getThreadLimit() {
+    const configured = Number(process.env.CHAT_THREAD_LIMIT);
+    return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 200;
+  }
+
+  getExpiresAt(days = this.getHistoryRetentionDays()) {
+    if (!Number.isFinite(days) || days <= 0) {
+      return null;
+    }
+    return new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+  }
+
+  getInitialMessageExpiry({ direction, status, followUpState }) {
+    const isOpenInboundFollowUp =
+      direction === 'inbound' &&
+      (followUpState === 'open' || status === 'needs_admin_follow_up');
+
+    return isOpenInboundFollowUp ? null : this.getExpiresAt();
+  }
+
+  async applyHybridRetentionPolicy() {
+    const expiresAt = this.getExpiresAt();
+    if (!expiresAt) {
+      logger.info('Chat history TTL is disabled because CHAT_HISTORY_RETENTION_DAYS is not positive');
+      return { modifiedCount: 0 };
+    }
+
+    const result = await Message.updateMany(
+      {
+        expires_at: null,
+        $or: [
+          { direction: { $ne: 'inbound' } },
+          { status: 'handled_by_bot' },
+          { follow_up_state: 'resolved' }
+        ]
+      },
+      { $set: { expires_at: expiresAt } }
+    );
+
+    logger.info(`Hybrid chat retention applied to ${result.modifiedCount || 0} cached message(s)`);
+    return result;
+  }
+
+  shouldSaveInboundImageKnowledge() {
+    return process.env.WA_IMAGE_SAVE_TO_KNOWLEDGE !== 'false';
+  }
+
   isDeleteForEveryoneAllowed(message) {
     if (!message) return false;
     if (!message.wa_from_me) return false;
@@ -65,6 +118,55 @@ class MessageService {
 
     const nowSec = Math.floor(Date.now() / 1000);
     return nowSec - messageSec <= this.getEditWindowSeconds();
+  }
+
+  async getConversationMemory(phone, excludeWaMessageId = null, limit = ragService.memoryLimit) {
+    const query = {
+      phone,
+      deleted_for_admin: { $ne: true },
+      deleted_for_all_at: null,
+      is_revoked: { $ne: true },
+      $or: [
+        { message_in: { $ne: null } },
+        { message_out: { $ne: null } }
+      ]
+    };
+
+    if (excludeWaMessageId) {
+      query.wa_message_id = { $ne: excludeWaMessageId };
+    }
+
+    const messages = await Message.find(query)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    return messages.reverse().map((message) => ({
+      role: message.direction === 'inbound' ? 'user' : 'assistant',
+      text: this.extractDisplayText(message)
+    })).filter((message) => message.text);
+  }
+
+  async saveInboundImageAsKnowledge(phone, imageText, waMessageId = null) {
+    const normalizedText = (imageText || '').trim();
+    if (!this.shouldSaveInboundImageKnowledge() || normalizedText.length < 20) {
+      return null;
+    }
+
+    try {
+      const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+      const title = `WA Image ${phone} ${timestamp}`;
+      const document = await ragService.ingestText({
+        title,
+        text: normalizedText
+      });
+
+      logger.info(`Inbound image saved as knowledge (phone=${phone}, wa_message_id=${waMessageId || 'none'}, document=${document?._id || 'none'})`);
+      return document;
+    } catch (error) {
+      logger.warn(`Failed to save inbound image as knowledge (phone=${phone}, wa_message_id=${waMessageId || 'none'}): ${error.message}`);
+      return null;
+    }
   }
 
   async processMessage(phone, messageText, whatsappSocket, replyJid = phone, options = {}) {
@@ -114,13 +216,21 @@ class MessageService {
         wa_participant: incomingKey?.participant || null,
         wa_from_me: incomingKey?.fromMe ?? false,
         wa_message_timestamp: options?.incomingMessageTimestamp || null,
-        reply_to_wa_message_id: quotedWaMessageId
+        reply_to_wa_message_id: quotedWaMessageId,
+        expires_at: this.getInitialMessageExpiry({
+          direction: 'inbound',
+          status: hasMatchedRule ? 'handled_by_bot' : 'needs_admin_follow_up',
+          followUpState: hasMatchedRule ? 'resolved' : 'open'
+        })
       });
 
       await inboundMessage.save();
 
-      if (hasMatchedRule) {
-        const responseText = matchedRule.response;
+      if (options?.imageKnowledgeText) {
+        await this.saveInboundImageAsKnowledge(phone, options.imageKnowledgeText, incomingMessageId);
+      }
+
+      const sendBotReply = async ({ responseText, matchedRuleId = null, needsAdminFollowUp = false, logSource = 'bot' }) => {
         try {
           const sent = await whatsappSocket.sendMessage(replyJid, { text: responseText });
 
@@ -128,7 +238,7 @@ class MessageService {
             phone,
             message_in: null,
             message_out: responseText,
-            matched_rule: matchedRule._id,
+            matched_rule: matchedRuleId,
             status: 'handled_by_bot',
             direction: 'outbound',
             sender_type: 'bot',
@@ -138,17 +248,35 @@ class MessageService {
             wa_remote_jid: sent?.key?.remoteJid || replyJid || null,
             wa_participant: sent?.key?.participant || null,
             wa_from_me: sent?.key?.fromMe ?? true,
-            wa_message_timestamp: sent?.messageTimestamp || null
+            wa_message_timestamp: sent?.messageTimestamp || null,
+            expires_at: this.getExpiresAt()
           });
 
           await outboundMessage.save();
-          logger.info(`Auto-reply sent to ${replyJid} (source=${phone}): ${responseText}`);
+
+          if (!needsAdminFollowUp) {
+            await Message.updateOne(
+              { _id: inboundMessage._id },
+              {
+                $set: {
+                  status: 'handled_by_bot',
+                  follow_up_state: 'resolved',
+                  follow_up_resolved_at: new Date(),
+                  follow_up_resolved_by: 'bot',
+                  expires_at: this.getExpiresAt()
+                }
+              }
+            );
+          }
+
+          logger.info(`Auto-reply sent to ${replyJid} (source=${phone}, mode=${logSource}): ${responseText}`);
+          return outboundMessage;
         } catch (sendError) {
           await Message.create({
             phone,
             message_in: null,
             message_out: responseText,
-            matched_rule: matchedRule._id,
+            matched_rule: matchedRuleId,
             status: 'needs_admin_follow_up',
             direction: 'outbound',
             sender_type: 'bot',
@@ -162,7 +290,8 @@ class MessageService {
             wa_remote_jid: replyJid || null,
             wa_participant: null,
             wa_from_me: true,
-            wa_message_timestamp: null
+            wa_message_timestamp: null,
+            expires_at: this.getExpiresAt()
           });
 
           await Message.updateOne(
@@ -177,10 +306,34 @@ class MessageService {
             }
           );
 
-          logger.error(`Auto-reply failed to ${replyJid} (source=${phone})`, sendError);
+          logger.error(`Auto-reply failed to ${replyJid} (source=${phone}, mode=${logSource})`, sendError);
         }
+      };
+
+      if (hasMatchedRule) {
+        await sendBotReply({
+          responseText: matchedRule.response,
+          matchedRuleId: matchedRule._id,
+          needsAdminFollowUp: false,
+          logSource: 'rule'
+        });
       } else {
-        logger.info(`Message from ${phone} requires admin follow up`);
+        const conversationMemory = await this.getConversationMemory(phone, incomingMessageId);
+        const ragAnswer = await ragService.generateAnswer(normalizedText, { conversationMemory });
+        if (ragAnswer?.shouldSend && ragAnswer.text) {
+          await sendBotReply({
+            responseText: ragAnswer.text,
+            matchedRuleId: null,
+            needsAdminFollowUp: ragAnswer.needsAdminFollowUp,
+            logSource: ragAnswer.source || 'rag'
+          });
+
+          if (ragAnswer.needsAdminFollowUp) {
+            logger.info(`RAG response sent to ${phone}, message remains open for admin follow up`);
+          }
+        } else {
+          logger.info(`Message from ${phone} requires admin follow up`);
+        }
       }
 
       return inboundMessage;
@@ -209,7 +362,8 @@ class MessageService {
         wa_participant: incomingKey?.participant || null,
         wa_from_me: incomingKey?.fromMe ?? false,
         wa_message_timestamp: options?.incomingMessageTimestamp || null,
-        reply_to_wa_message_id: quotedWaMessageId
+        reply_to_wa_message_id: quotedWaMessageId,
+        expires_at: null
       });
 
       await failedMessage.save();
@@ -327,7 +481,8 @@ class MessageService {
         wa_remote_jid: sent?.key?.remoteJid || replyJid || null,
         wa_participant: sent?.key?.participant || null,
         wa_from_me: sent?.key?.fromMe ?? true,
-        wa_message_timestamp: sent?.messageTimestamp || null
+        wa_message_timestamp: sent?.messageTimestamp || null,
+        expires_at: this.getExpiresAt()
       });
 
       await outboundMessage.save();
@@ -340,7 +495,8 @@ class MessageService {
               follow_up_state: 'resolved',
               follow_up_resolved_at: new Date(),
               follow_up_resolved_by: resolvedBy || 'admin',
-              status: 'handled_by_bot'
+              status: 'handled_by_bot',
+              expires_at: this.getExpiresAt()
             }
           }
         );
@@ -368,11 +524,166 @@ class MessageService {
         wa_remote_jid: replyJid || null,
         wa_participant: null,
         wa_from_me: true,
-        wa_message_timestamp: null
+        wa_message_timestamp: null,
+        expires_at: this.getExpiresAt()
       });
 
       await failedOutboundMessage.save();
       logger.error(`Manual reply failed to ${phone} via ${replyJid}:`, error);
+      throw error;
+    }
+  }
+
+  async sendManualImageReply(phone, imageBuffer, caption, whatsappService, options = {}) {
+    if (!Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) {
+      throw new Error('File gambar wajib diisi');
+    }
+
+    const normalizedCaption = (caption || '').trim();
+    const displayText = normalizedCaption ? `[Gambar] ${normalizedCaption}` : '[Gambar]';
+    const { replyToMessageId = null, resolvedBy = null } = options;
+
+    let replyTargetMessage = null;
+    let pendingTargetMessage = null;
+
+    if (replyToMessageId) {
+      if (!mongoose.Types.ObjectId.isValid(replyToMessageId)) {
+        throw new Error('reply_to_message_id tidak valid');
+      }
+
+      replyTargetMessage = await Message.findOne({
+        _id: replyToMessageId,
+        phone,
+        $or: [
+          { message_in: { $ne: null } },
+          { message_out: { $ne: null } }
+        ],
+        deleted_for_admin: { $ne: true },
+        deleted_for_all_at: null
+      });
+
+      if (!replyTargetMessage) {
+        throw new Error('Pesan target reply tidak ditemukan');
+      }
+
+      pendingTargetMessage = await Message.findOne({
+        _id: replyToMessageId,
+        phone,
+        message_in: { $ne: null },
+        $and: [
+          {
+            $or: [
+              { direction: 'inbound' },
+              { direction: { $exists: false } },
+              { direction: null }
+            ]
+          },
+          {
+            $or: [
+              { follow_up_state: 'open' },
+              {
+                $and: [
+                  { follow_up_state: null },
+                  { status: 'needs_admin_follow_up' }
+                ]
+              }
+            ]
+          }
+        ]
+      });
+    }
+
+    const replyJid = await this.resolveReplyJidByPhone(phone);
+
+    try {
+      const quoted =
+        replyTargetMessage && replyTargetMessage.wa_message_id
+          ? {
+              key: {
+                id: replyTargetMessage.wa_message_id,
+                remoteJid: replyTargetMessage.wa_remote_jid || replyJid,
+                fromMe: Boolean(replyTargetMessage.wa_from_me),
+                participant: replyTargetMessage.wa_participant || undefined
+              },
+              message: {
+                conversation: replyTargetMessage.message_in || replyTargetMessage.message_out || ''
+              }
+            }
+          : undefined;
+
+      const sent = await whatsappService.sendImageMessage(
+        replyJid,
+        imageBuffer,
+        normalizedCaption,
+        quoted ? { quoted } : undefined
+      );
+
+      const outboundMessage = new Message({
+        phone,
+        message_in: null,
+        message_out: displayText,
+        matched_rule: null,
+        status: 'handled_by_bot',
+        direction: 'outbound',
+        sender_type: 'admin',
+        delivery_status: 'sent',
+        wa_jid: replyJid,
+        follow_up_state: null,
+        follow_up_resolved_at: null,
+        follow_up_resolved_by: null,
+        reply_to_message_id: replyTargetMessage?._id || null,
+        wa_message_id: sent?.key?.id || null,
+        wa_remote_jid: sent?.key?.remoteJid || replyJid || null,
+        wa_participant: sent?.key?.participant || null,
+        wa_from_me: sent?.key?.fromMe ?? true,
+        wa_message_timestamp: sent?.messageTimestamp || null,
+        expires_at: this.getExpiresAt()
+      });
+
+      await outboundMessage.save();
+
+      if (pendingTargetMessage) {
+        await Message.updateOne(
+          { _id: pendingTargetMessage._id },
+          {
+            $set: {
+              follow_up_state: 'resolved',
+              follow_up_resolved_at: new Date(),
+              follow_up_resolved_by: resolvedBy || 'admin',
+              status: 'handled_by_bot',
+              expires_at: this.getExpiresAt()
+            }
+          }
+        );
+      }
+
+      logger.info(`Manual image reply sent to ${phone} via ${replyJid}`);
+      return outboundMessage;
+    } catch (error) {
+      const failedOutboundMessage = new Message({
+        phone,
+        message_in: null,
+        message_out: displayText,
+        matched_rule: null,
+        status: 'needs_admin_follow_up',
+        direction: 'outbound',
+        sender_type: 'admin',
+        delivery_status: 'failed',
+        wa_jid: replyJid,
+        follow_up_state: null,
+        follow_up_resolved_at: null,
+        follow_up_resolved_by: null,
+        reply_to_message_id: replyTargetMessage?._id || null,
+        wa_message_id: null,
+        wa_remote_jid: replyJid || null,
+        wa_participant: null,
+        wa_from_me: true,
+        wa_message_timestamp: null,
+        expires_at: this.getExpiresAt()
+      });
+
+      await failedOutboundMessage.save();
+      logger.error(`Manual image reply failed to ${phone} via ${replyJid}:`, error);
       throw error;
     }
   }
@@ -461,15 +772,20 @@ class MessageService {
     }));
   }
 
-  async getConversationByPhone(phone) {
-    const messages = await Message.find({
+  async getConversationByPhone(phone, limit = this.getThreadLimit()) {
+    const normalizedLimit = Number.isFinite(Number(limit)) && Number(limit) > 0
+      ? Math.min(Math.floor(Number(limit)), 500)
+      : this.getThreadLimit();
+
+    const messages = (await Message.find({
       phone,
       deleted_for_admin: { $ne: true },
       deleted_for_all_at: null
     })
       .populate('matched_rule')
-      .sort({ createdAt: 1 })
-      .lean();
+      .sort({ createdAt: -1 })
+      .limit(normalizedLimit)
+      .lean()).reverse();
 
     const expanded = [];
     const seenWAKey = new Set();
@@ -608,6 +924,7 @@ class MessageService {
       target.follow_up_resolved_at = new Date();
       target.follow_up_resolved_by = revokedBy;
       target.status = 'handled_by_bot';
+      target.expires_at = this.getExpiresAt();
     }
 
     await target.save();
@@ -655,6 +972,7 @@ class MessageService {
     message.follow_up_resolved_at = new Date();
     message.follow_up_resolved_by = resolvedBy;
     message.status = 'handled_by_bot';
+    message.expires_at = this.getExpiresAt();
     await message.save();
 
     return message;

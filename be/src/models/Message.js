@@ -122,6 +122,10 @@ const messageSchema = new mongoose.Schema({
   revoked_by: {
     type: String,
     default: null
+  },
+  expires_at: {
+    type: Date,
+    default: null
   }
 }, {
   timestamps: true
@@ -130,5 +134,7 @@ const messageSchema = new mongoose.Schema({
 messageSchema.index({ phone: 1, createdAt: -1 });
 messageSchema.index({ direction: 1, sender_type: 1, createdAt: -1 });
 messageSchema.index({ follow_up_state: 1, direction: 1, createdAt: -1 });
+messageSchema.index({ phone: 1, wa_message_id: 1, direction: 1, sender_type: 1 });
+messageSchema.index({ expires_at: 1 }, { expireAfterSeconds: 0 });
 
 module.exports = mongoose.model('Message', messageSchema);

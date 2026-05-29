@@ -1,5 +1,5 @@
 import axios from "axios";
-import type { Rule, Message, WAStatus, DashboardStats, ConversationSummary, ChatMessage } from "@/types";
+import type { Rule, Message, WAStatus, DashboardStats, ConversationSummary, ChatMessage, KnowledgeDocument, KnowledgeStatus } from "@/types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:3000/api";
 
@@ -101,6 +101,51 @@ export const deleteRule = async (id: string): Promise<void> => {
   await api.delete(`/rules/${id}`);
 };
 
+// Knowledge
+export const getKnowledgeStatus = async (): Promise<KnowledgeStatus> => {
+  const { data } = await api.get("/knowledge/status");
+  return data.data;
+};
+
+export const getKnowledgeDocuments = async (): Promise<KnowledgeDocument[]> => {
+  const { data } = await api.get("/knowledge/documents");
+  return data.data;
+};
+
+export const uploadKnowledgeDocument = async (file: File): Promise<KnowledgeDocument> => {
+  const form = new FormData();
+  form.append("file", file);
+  const { data } = await api.post("/knowledge/documents", form, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
+  return data.data;
+};
+
+export const createTextKnowledgeDocument = async (title: string, text: string): Promise<KnowledgeDocument> => {
+  const { data } = await api.post("/knowledge/documents/text", { title, text });
+  return data.data;
+};
+
+export const updateKnowledgeDocument = async (id: string, title: string, text: string): Promise<KnowledgeDocument> => {
+  const { data } = await api.put(`/knowledge/documents/${id}`, { title, text });
+  return data.data;
+};
+
+export const reindexKnowledgeDocument = async (id: string): Promise<KnowledgeDocument> => {
+  const { data } = await api.post(`/knowledge/documents/${id}/reindex`);
+  return data.data;
+};
+
+export const activateKnowledgeDocument = async (id: string): Promise<KnowledgeDocument> => {
+  const { data } = await api.post(`/knowledge/documents/${id}/activate`);
+  return data.data;
+};
+
+export const deleteKnowledgeDocument = async (id: string): Promise<KnowledgeDocument> => {
+  const { data } = await api.delete(`/knowledge/documents/${id}`);
+  return data.data;
+};
+
 // Messages
 export const getMessages = async (): Promise<Message[]> => {
   const { data } = await api.get("/messages");
@@ -123,6 +168,24 @@ export const sendManualReply = async (
   reply_to_message_id?: string | null
 ): Promise<ChatMessage> => {
   const { data } = await api.post("/messages/reply", { phone, text, reply_to_message_id });
+  return mapChatMessage(data.data);
+};
+
+export const sendManualImageReply = async (
+  phone: string,
+  image: File,
+  caption?: string,
+  reply_to_message_id?: string | null
+): Promise<ChatMessage> => {
+  const form = new FormData();
+  form.append("phone", phone);
+  form.append("image", image);
+  if (caption) form.append("caption", caption);
+  if (reply_to_message_id) form.append("reply_to_message_id", reply_to_message_id);
+
+  const { data } = await api.post("/messages/reply-image", form, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
   return mapChatMessage(data.data);
 };
 

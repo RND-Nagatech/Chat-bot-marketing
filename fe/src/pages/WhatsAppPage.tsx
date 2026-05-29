@@ -144,13 +144,13 @@ export default function WhatsAppPage() {
 
   return (
     <div>
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-foreground">Pengaturan WhatsApp</h1>
-        <p className="text-sm text-muted-foreground">Kelola koneksi WhatsApp Anda</p>
+      <div className="surface-panel mb-6 rounded-lg p-5">
+        <h1 className="text-3xl font-extrabold tracking-tight text-foreground">Pengaturan WhatsApp</h1>
+        <p className="mt-1 text-sm text-muted-foreground">Kelola koneksi WhatsApp Anda</p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="rounded-xl border bg-card p-6 shadow-sm">
+        <div className="surface-panel rounded-lg p-6">
           <h2 className="text-lg font-semibold text-card-foreground mb-4">Status Koneksi</h2>
           <div className="space-y-4">
             <div className="flex items-center gap-3">
@@ -217,7 +217,7 @@ export default function WhatsAppPage() {
           </div>
         </div>
 
-        <div className="rounded-xl border bg-card p-6 shadow-sm">
+        <div className="surface-panel rounded-lg p-6">
           <h2 className="text-lg font-semibold text-card-foreground mb-4">Kode QR</h2>
           {qr ? (
             <div className="flex flex-col items-center gap-4">

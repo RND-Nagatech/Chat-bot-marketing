@@ -2,6 +2,7 @@ const {
   default: makeWASocket,
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   fetchLatestWaWebVersion,
   useMultiFileAuthState,
   makeCacheableSignalKeyStore
@@ -11,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('../utils/logger');
 const messageService = require('./messageService');
+const ragService = require('./ragService');
 const WhatsAppSession = require('../models/WhatsAppSession');
 
 class WhatsAppService {
@@ -255,7 +257,8 @@ class WhatsAppService {
         continue;
       }
 
-      const messageText = this.extractMessageText(payload);
+      const processableMessage = await this.extractProcessableMessageText(message, payload);
+      const messageText = processableMessage.text;
       const quotedWaMessageId = this.extractQuotedWaMessageId(payload);
 
       if (messageText) {
@@ -272,7 +275,8 @@ class WhatsAppService {
           incomingKey: message.key,
           incomingRemoteJid: sender,
           incomingMessageTimestamp: incomingTimestamp,
-          quotedWaMessageId
+          quotedWaMessageId,
+          imageKnowledgeText: processableMessage.imageText || null
         });
       } else {
         logger.info(`Message received from ${sender} but no supported text payload was found`);
@@ -400,6 +404,67 @@ class WhatsAppService {
     ).toString().trim();
   }
 
+  async extractProcessableMessageText(message, payload) {
+    const text = this.extractMessageText(payload);
+    const imageText = await this.extractImageText(message, payload);
+
+    if (text && imageText) {
+      return {
+        text: [
+          text,
+          '',
+          'Teks yang terbaca dari gambar:',
+          imageText
+        ].join('\n').trim(),
+        imageText
+      };
+    }
+
+    if (imageText) {
+      return {
+        text: [
+          'Customer mengirim gambar.',
+          '',
+          'Teks yang terbaca dari gambar:',
+          imageText
+        ].join('\n').trim(),
+        imageText
+      };
+    }
+
+    return { text, imageText: '' };
+  }
+
+  async extractImageText(message, payload) {
+    if (!payload?.imageMessage) {
+      return '';
+    }
+    if (process.env.WA_IMAGE_OCR_ENABLED === 'false') {
+      return '';
+    }
+
+    try {
+      const buffer = await downloadMediaMessage(
+        message,
+        'buffer',
+        {},
+        {
+          logger: this.getBaileysKeyStoreLogger(),
+          reuploadRequest: this.sock?.updateMediaMessage
+        }
+      );
+
+      const imageText = await ragService.extractImageBufferTextWithOcr(buffer);
+      if (imageText) {
+        logger.info(`OCR extracted ${imageText.length} chars from inbound image`);
+      }
+      return imageText;
+    } catch (error) {
+      logger.warn(`Failed to OCR inbound image: ${error.message}`);
+      return '';
+    }
+  }
+
   extractContextInfo(payload) {
     if (!payload) return null;
     return (
@@ -433,6 +498,28 @@ class WhatsAppService {
       return sent;
     } catch (error) {
       logger.error('Error sending message:', error);
+      throw error;
+    }
+  }
+
+  async sendImageMessage(jid, imageBuffer, caption = '', options = undefined) {
+    if (!this.sock || this.status !== 'connected') {
+      throw new Error('WhatsApp is not connected');
+    }
+
+    try {
+      const sent = await this.sock.sendMessage(
+        jid,
+        {
+          image: imageBuffer,
+          caption: (caption || '').trim()
+        },
+        options
+      );
+      logger.info(`Image message sent to ${jid}`);
+      return sent;
+    } catch (error) {
+      logger.error('Error sending image message:', error);
       throw error;
     }
   }

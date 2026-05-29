@@ -7,10 +7,13 @@ interface Props {
 
 export function DashboardLayout({ onLogout }: Props) {
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-background">
+    <div className="relative flex h-screen w-full overflow-hidden bg-transparent">
+      <div className="subtle-grid pointer-events-none absolute inset-x-0 top-0 h-80" />
       <AppSidebar onLogout={onLogout} />
-      <main className="min-h-0 flex-1 overflow-y-auto p-6 lg:p-8">
-        <Outlet />
+      <main className="relative min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto w-full max-w-[1440px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
+          <Outlet />
+        </div>
       </main>
     </div>
   );

@@ -62,6 +62,33 @@ export interface DashboardStats {
   activeRules: number;
 }
 
+export interface KnowledgeDocument {
+  _id: string;
+  title: string;
+  original_filename: string;
+  mime_type: string;
+  size_bytes: number;
+  extracted_text?: string;
+  status: "processing" | "indexed" | "failed";
+  status_active: boolean;
+  chunk_count: number;
+  error_message?: string | null;
+  indexed_at?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface KnowledgeStatus {
+  rag_enabled: boolean;
+  lm_studio: {
+    connected: boolean;
+    base_url: string;
+    chat_model: string;
+    embedding_model: string;
+    error?: string;
+  };
+}
+
 export interface User {
   id: string;
   email: string;

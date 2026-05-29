@@ -7,7 +7,7 @@ import { DashboardLayout } from "@/components/DashboardLayout";
 import Index from "./pages/Index";
 import LoginPage from "./pages/LoginPage";
 import DashboardPage from "./pages/DashboardPage";
-import RulesPage from "./pages/RulesPage";
+import KnowledgePage from "./pages/KnowledgePage";
 import MessagesPage from "./pages/MessagesPage";
 import WhatsAppPage from "./pages/WhatsAppPage";
 import NotFound from "./pages/NotFound";
@@ -31,7 +31,8 @@ function AppRoutes() {
       <Route path="/login" element={user ? <Navigate to="/dashboard" replace /> : <LoginPage onLogin={saveUser} />} />
       <Route element={user ? <DashboardLayout onLogout={logout} /> : <Navigate to="/login" replace />}>
         <Route path="/dashboard" element={<DashboardPage />} />
-        <Route path="/rules" element={<RulesPage />} />
+        <Route path="/rules" element={<Navigate to="/knowledge" replace />} />
+        <Route path="/knowledge" element={<KnowledgePage />} />
         <Route path="/messages" element={<MessagesPage />} />
         <Route path="/whatsapp" element={<WhatsAppPage />} />
       </Route>

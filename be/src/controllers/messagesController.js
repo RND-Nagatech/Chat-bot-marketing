@@ -1,6 +1,33 @@
+const multer = require('multer');
 const messageService = require('../services/messageService');
 const whatsappService = require('../services/whatsappService');
 const logger = require('../utils/logger');
+
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024
+  },
+  fileFilter: (req, file, cb) => {
+    if (!/^image\/(jpeg|png|webp)$/i.test(file.mimetype || '')) {
+      cb(new Error('File harus berupa gambar JPG, PNG, atau WEBP'));
+      return;
+    }
+    cb(null, true);
+  }
+});
+
+exports.imageUploadMiddleware = (req, res, next) => {
+  imageUpload.single('image')(req, res, (error) => {
+    if (!error) return next();
+
+    const message = error.code === 'LIMIT_FILE_SIZE'
+      ? 'Ukuran gambar maksimal 5MB'
+      : error.message || 'Gagal membaca upload gambar';
+
+    return res.status(400).json({ success: false, message });
+  });
+};
 
 exports.getAllMessages = async (req, res) => {
   try {
@@ -67,7 +94,8 @@ exports.getConversations = async (req, res) => {
 exports.getConversationByPhone = async (req, res) => {
   try {
     const { phone } = req.params;
-    const messages = await messageService.getConversationByPhone(phone);
+    const limit = parseInt(req.query.limit, 10) || undefined;
+    const messages = await messageService.getConversationByPhone(phone, limit);
 
     res.json({
       success: true,
@@ -133,6 +161,65 @@ exports.sendManualReply = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Gagal mengirim balasan manual'
+    });
+  }
+};
+
+exports.sendManualImageReply = async (req, res) => {
+  try {
+    const { phone, caption = '', reply_to_message_id: replyToMessageId } = req.body || {};
+
+    if (!phone || typeof phone !== 'string') {
+      return res.status(400).json({
+        success: false,
+        message: 'Nomor telepon wajib diisi'
+      });
+    }
+
+    if (!req.file?.buffer) {
+      return res.status(400).json({
+        success: false,
+        message: 'File gambar wajib diisi'
+      });
+    }
+
+    if (!whatsappService.isConnected()) {
+      return res.status(400).json({
+        success: false,
+        message: 'WhatsApp belum terhubung. Silakan hubungkan terlebih dahulu.'
+      });
+    }
+
+    const resolvedBy = req.user?.email || req.user?.userId || 'admin';
+    const message = await messageService.sendManualImageReply(
+      phone.trim(),
+      req.file.buffer,
+      caption,
+      whatsappService,
+      {
+        replyToMessageId,
+        resolvedBy
+      }
+    );
+
+    res.json({
+      success: true,
+      message: 'Gambar berhasil dikirim',
+      data: message
+    });
+  } catch (error) {
+    logger.error('Error sending manual image reply:', error);
+
+    if (/tidak valid|tidak ditemukan|kosong|gambar/i.test(error.message || '')) {
+      return res.status(400).json({
+        success: false,
+        message: error.message
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: 'Gagal mengirim gambar'
     });
   }
 };

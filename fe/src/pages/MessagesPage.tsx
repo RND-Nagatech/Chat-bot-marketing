@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
-import { ChevronDown, ChevronsDown, Search, Send, X } from "lucide-react";
+import { ChevronDown, ChevronsDown, Image, Search, Send, X } from "lucide-react";
 import {
   editMessage,
   deleteMessageForAll,
@@ -9,6 +9,7 @@ import {
   getConversations,
   getWAStatus,
   resolvePendingMessage,
+  sendManualImageReply,
   sendManualReply,
 } from "@/services/api";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -38,6 +39,7 @@ export default function MessagesPage() {
   const [threadMessages, setThreadMessages] = useState<ChatMessage[]>([]);
   const [threadLoading, setThreadLoading] = useState(false);
   const [replyText, setReplyText] = useState("");
+  const [replyImage, setReplyImage] = useState<File | null>(null);
   const [sending, setSending] = useState(false);
   const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
   const [editTarget, setEditTarget] = useState<ChatMessage | null>(null);
@@ -59,6 +61,7 @@ export default function MessagesPage() {
   });
   const threadContainerRef = useRef<HTMLDivElement | null>(null);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
   const isThreadNearBottomRef = useRef(true);
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
   const hasFocusedPendingRef = useRef(false);
@@ -141,6 +144,7 @@ export default function MessagesPage() {
     setActivePhone(phone);
     setModalOpen(true);
     setReplyText("");
+    setReplyImage(null);
     setReplyTarget(null);
     setEditTarget(null);
     setThreadSearch("");
@@ -270,9 +274,13 @@ export default function MessagesPage() {
   const isWAConnected = waStatus?.status === "connected";
 
   const handleSendReply = async () => {
-    if (!activePhone || !replyText.trim()) return;
+    if (!activePhone || (!replyText.trim() && !replyImage)) return;
     if (!isWAConnected) {
       toast.error("WhatsApp belum terhubung. Silakan hubungkan dulu.");
+      return;
+    }
+    if (editTarget && replyImage) {
+      toast.error("Edit pesan hanya mendukung teks.");
       return;
     }
 
@@ -298,15 +306,26 @@ export default function MessagesPage() {
         );
         setReplyText("");
         setEditTarget(null);
+        setReplyImage(null);
+        if (imageInputRef.current) {
+          imageInputRef.current.value = "";
+        }
         await loadConversationDetail(activePhone, { silent: true });
         await loadConversations();
         toast.success("Pesan berhasil diedit");
       } else {
-        const sent = await sendManualReply(
-          activePhone,
-          replyText.trim(),
-          replyTarget?.source_message_id || replyTarget?.id || null
-        );
+        const sent = replyImage
+          ? await sendManualImageReply(
+              activePhone,
+              replyImage,
+              replyText.trim(),
+              replyTarget?.source_message_id || replyTarget?.id || null
+            )
+          : await sendManualReply(
+              activePhone,
+              replyText.trim(),
+              replyTarget?.source_message_id || replyTarget?.id || null
+            );
         setThreadMessages((prev) => [...prev, sent]);
         if (replyTarget?.id && replyTarget.follow_up_state === "open") {
           setThreadMessages((prev) =>
@@ -318,6 +337,10 @@ export default function MessagesPage() {
           );
         }
         setReplyText("");
+        setReplyImage(null);
+        if (imageInputRef.current) {
+          imageInputRef.current.value = "";
+        }
         setReplyTarget(null);
         await loadConversationDetail(activePhone, { silent: true });
         await loadConversations();
@@ -333,7 +356,7 @@ export default function MessagesPage() {
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      if (!sending && isWAConnected && replyText.trim()) {
+      if (!sending && isWAConnected && (replyText.trim() || replyImage)) {
         void handleSendReply();
       }
     }
@@ -467,10 +490,10 @@ export default function MessagesPage() {
   return (
     <div>
       <div className="mb-6">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="surface-panel flex flex-col gap-4 rounded-lg p-5 sm:flex-row sm:items-start sm:justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-foreground">Riwayat Chat</h1>
-            <p className="text-sm text-muted-foreground">Inbox per nomor dengan aktivitas chat terakhir</p>
+            <h1 className="text-3xl font-extrabold tracking-tight text-foreground">Riwayat Chat</h1>
+            <p className="mt-1 text-sm text-muted-foreground">Inbox per nomor dengan aktivitas chat terakhir</p>
           </div>
           <div className="flex items-center gap-2 self-start rounded-lg border bg-card px-3 py-2">
             <span className="text-xs font-medium text-muted-foreground">Auto Refresh</span>
@@ -606,6 +629,10 @@ export default function MessagesPage() {
             setActivePhone(null);
             setThreadMessages([]);
             setReplyText("");
+            setReplyImage(null);
+            if (imageInputRef.current) {
+              imageInputRef.current.value = "";
+            }
             setReplyTarget(null);
             setEditTarget(null);
             setIsThreadNearBottom(true);
@@ -812,6 +839,10 @@ export default function MessagesPage() {
                                     setEditTarget(message);
                                     setReplyTarget(null);
                                     setReplyText(message.text);
+                                    setReplyImage(null);
+                                    if (imageInputRef.current) {
+                                      imageInputRef.current.value = "";
+                                    }
                                   }}
                                 >
                                   Edit
@@ -899,6 +930,7 @@ export default function MessagesPage() {
                     onClick={() => {
                       setReplyTarget(null);
                       setReplyText("");
+                      setReplyImage(null);
                     }}
                     className="inline-flex items-center gap-1 rounded-md border border-amber-300 px-2 py-0.5 hover:bg-amber-100"
                   >
@@ -914,20 +946,76 @@ export default function MessagesPage() {
                 WhatsApp belum terhubung. Hubungkan di menu Pengaturan WhatsApp untuk bisa kirim balasan.
               </div>
             )}
+            {replyImage && (
+              <div className="flex items-center justify-between gap-3 rounded-lg border bg-card px-3 py-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Image className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium text-foreground">{replyImage.name}</div>
+                    <div className="text-xs text-muted-foreground">{(replyImage.size / 1024 / 1024).toFixed(2)} MB</div>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setReplyImage(null);
+                    if (imageInputRef.current) imageInputRef.current.value = "";
+                  }}
+                  className="rounded-lg p-1.5 transition-colors hover:bg-muted"
+                  aria-label="Hapus gambar"
+                >
+                  <X className="h-4 w-4 text-muted-foreground" />
+                </button>
+              </div>
+            )}
             <div className="flex items-end gap-2">
+              <input
+                ref={imageInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0] || null;
+                  if (!file) {
+                    setReplyImage(null);
+                    return;
+                  }
+                  if (!/^image\/(png|jpeg|webp)$/i.test(file.type)) {
+                    toast.error("Gambar harus JPG, PNG, atau WEBP");
+                    event.target.value = "";
+                    return;
+                  }
+                  if (file.size > 5 * 1024 * 1024) {
+                    toast.error("Ukuran gambar maksimal 5MB");
+                    event.target.value = "";
+                    return;
+                  }
+                  setReplyImage(file);
+                  setEditTarget(null);
+                }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => imageInputRef.current?.click()}
+                disabled={!isWAConnected || sending || Boolean(editTarget)}
+                className="h-[56px] shrink-0 px-3"
+                title={editTarget ? "Gambar tidak tersedia saat edit pesan" : "Kirim gambar"}
+              >
+                <Image className="h-4 w-4" />
+              </Button>
               <Textarea
                 ref={composerTextareaRef}
                 value={replyText}
                 onChange={(e) => setReplyText(e.target.value)}
                 onKeyDown={handleComposerKeyDown}
-                placeholder={editTarget ? "Edit isi pesan..." : "Tulis balasan manual..."}
+                placeholder={editTarget ? "Edit isi pesan..." : replyImage ? "Tulis caption gambar..." : "Tulis balasan manual..."}
                 rows={1}
                 disabled={!isWAConnected || sending}
                 className="min-h-[56px] max-h-[160px] resize-none overflow-hidden box-border py-3 leading-5"
               />
               <Button
                 onClick={() => void handleSendReply()}
-                disabled={!isWAConnected || sending || !replyText.trim()}
+                disabled={!isWAConnected || sending || (!replyText.trim() && !replyImage)}
                 className="h-[56px] shrink-0 px-4"
               >
                 <Send className="h-4 w-4 mr-1" />

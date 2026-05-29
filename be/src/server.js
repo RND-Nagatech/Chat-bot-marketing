@@ -5,6 +5,7 @@ const connectDB = require('./config/database');
 const routes = require('./routes');
 const logger = require('./utils/logger');
 const whatsappService = require('./services/whatsappService');
+const messageService = require('./services/messageService');
 const fs = require('fs');
 const path = require('path');
 
@@ -62,6 +63,7 @@ const PORT = process.env.PORT || 3000;
 const startServer = async () => {
   try {
     await connectDB();
+    await messageService.applyHybridRetentionPolicy();
 
     const shouldAutoConnect =
       process.env.AUTO_CONNECT_WHATSAPP === 'true' || hasStoredWhatsAppSession();
