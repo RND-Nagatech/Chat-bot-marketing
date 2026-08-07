@@ -17,8 +17,17 @@ const knowledgeChunkSchema = new mongoose.Schema({
   },
   embedding: {
     type: [Number],
-    required: true,
     default: undefined
+  },
+  vector_store: {
+    type: String,
+    enum: ['mongo', 'qdrant'],
+    default: 'mongo',
+    index: true
+  },
+  qdrant_point_id: {
+    type: String,
+    default: null
   }
 }, {
   timestamps: true

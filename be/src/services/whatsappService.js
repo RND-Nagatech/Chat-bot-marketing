@@ -31,6 +31,39 @@ class WhatsAppService {
     return path.join(process.cwd(), 'auth_info');
   }
 
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  isTypingIndicatorEnabled() {
+    return process.env.WA_TYPING_INDICATOR_ENABLED !== 'false';
+  }
+
+  getTypingDelayMs(text = '') {
+    const minMs = Number(process.env.WA_TYPING_MIN_MS);
+    const maxMs = Number(process.env.WA_TYPING_MAX_MS);
+    const charsPerSecond = Number(process.env.WA_TYPING_CHARS_PER_SECOND);
+    const minDelay = Number.isFinite(minMs) && minMs >= 0 ? minMs : 900;
+    const maxDelay = Number.isFinite(maxMs) && maxMs > minDelay ? maxMs : 3500;
+    const cps = Number.isFinite(charsPerSecond) && charsPerSecond > 0 ? charsPerSecond : 45;
+    const estimated = ((text || '').length / cps) * 1000;
+    return Math.min(maxDelay, Math.max(minDelay, Math.floor(estimated)));
+  }
+
+  async sendTypingPresence(jid, text = '') {
+    if (!this.isTypingIndicatorEnabled() || !this.sock || this.status !== 'connected') {
+      return;
+    }
+
+    try {
+      await this.sock.sendPresenceUpdate('composing', jid);
+      await this.sleep(this.getTypingDelayMs(text));
+      await this.sock.sendPresenceUpdate('paused', jid);
+    } catch (error) {
+      logger.warn(`Failed to send typing presence to ${jid}: ${error.message}`);
+    }
+  }
+
   ensureAuthInfoDir() {
     if (!fs.existsSync(this.authInfoPath)) {
       fs.mkdirSync(this.authInfoPath, { recursive: true });
@@ -493,6 +526,7 @@ class WhatsAppService {
     }
 
     try {
+      await this.sendTypingPresence(jid, text);
       const sent = await this.sock.sendMessage(jid, { text }, options);
       logger.info(`Message sent to ${jid}: ${text}`);
       return sent;
@@ -508,6 +542,7 @@ class WhatsAppService {
     }
 
     try {
+      await this.sendTypingPresence(jid, caption || '[image]');
       const sent = await this.sock.sendMessage(
         jid,
         {

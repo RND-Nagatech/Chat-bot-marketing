@@ -38,6 +38,77 @@ class MessageService {
     return Math.floor(minutes * 60);
   }
 
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  isTypingIndicatorEnabled() {
+    return process.env.WA_TYPING_INDICATOR_ENABLED !== 'false';
+  }
+
+  getTypingDelayMs(text = '') {
+    const minMs = Number(process.env.WA_TYPING_MIN_MS);
+    const maxMs = Number(process.env.WA_TYPING_MAX_MS);
+    const charsPerSecond = Number(process.env.WA_TYPING_CHARS_PER_SECOND);
+    const minDelay = Number.isFinite(minMs) && minMs >= 0 ? minMs : 900;
+    const maxDelay = Number.isFinite(maxMs) && maxMs > minDelay ? maxMs : 3500;
+    const cps = Number.isFinite(charsPerSecond) && charsPerSecond > 0 ? charsPerSecond : 45;
+    const estimated = ((text || '').length / cps) * 1000;
+    return Math.min(maxDelay, Math.max(minDelay, Math.floor(estimated)));
+  }
+
+  async sendTypingPresence(socket, jid, text = '') {
+    if (!this.isTypingIndicatorEnabled() || !socket?.sendPresenceUpdate || !jid) {
+      return;
+    }
+
+    try {
+      await socket.sendPresenceUpdate('composing', jid);
+      await this.sleep(this.getTypingDelayMs(text));
+      await socket.sendPresenceUpdate('paused', jid);
+    } catch (error) {
+      logger.warn(`Failed to send typing presence to ${jid}: ${error.message}`);
+    }
+  }
+
+  startTypingPresence(socket, jid) {
+    if (!this.isTypingIndicatorEnabled() || !socket?.sendPresenceUpdate || !jid) {
+      return { stop: async () => {} };
+    }
+
+    let stopped = false;
+    let intervalId = null;
+    const configuredKeepAliveMs = Number(process.env.WA_TYPING_KEEP_ALIVE_MS);
+    const keepAliveMs = Number.isFinite(configuredKeepAliveMs) && configuredKeepAliveMs > 0
+      ? configuredKeepAliveMs
+      : 4500;
+    const send = async (state) => {
+      try {
+        await socket.sendPresenceUpdate(state, jid);
+      } catch (error) {
+        logger.warn(`Failed to send ${state} presence to ${jid}: ${error.message}`);
+      }
+    };
+
+    void send('composing');
+    intervalId = setInterval(() => {
+      if (!stopped) {
+        void send('composing');
+      }
+    }, keepAliveMs);
+
+    return {
+      stop: async () => {
+        if (stopped) return;
+        stopped = true;
+        if (intervalId) {
+          clearInterval(intervalId);
+        }
+        await send('paused');
+      }
+    };
+  }
+
   getHistoryRetentionDays() {
     const configured = Number(process.env.CHAT_HISTORY_RETENTION_DAYS);
     return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 30;
@@ -171,6 +242,7 @@ class MessageService {
 
   async processMessage(phone, messageText, whatsappSocket, replyJid = phone, options = {}) {
     let inboundMessage = null;
+    let typingPresence = null;
     const incomingKey = options?.incomingKey || null;
     const incomingRemoteJid = options?.incomingRemoteJid || replyJid || null;
     const incomingMessageId = incomingKey?.id || null;
@@ -194,6 +266,8 @@ class MessageService {
           return existingInbound;
         }
       }
+
+      typingPresence = this.startTypingPresence(whatsappSocket, replyJid);
 
       const matchedRule = await rulesEngine.matchRule(messageText);
       const hasMatchedRule = Boolean(matchedRule);
@@ -232,6 +306,10 @@ class MessageService {
 
       const sendBotReply = async ({ responseText, matchedRuleId = null, needsAdminFollowUp = false, logSource = 'bot' }) => {
         try {
+          if (typingPresence) {
+            await typingPresence.stop();
+            typingPresence = null;
+          }
           const sent = await whatsappSocket.sendMessage(replyJid, { text: responseText });
 
           const outboundMessage = new Message({
@@ -332,12 +410,28 @@ class MessageService {
             logger.info(`RAG response sent to ${phone}, message remains open for admin follow up`);
           }
         } else {
+          await sendBotReply({
+            responseText: ragService.fallbackReply(),
+            matchedRuleId: null,
+            needsAdminFollowUp: true,
+            logSource: 'rag_unavailable'
+          });
           logger.info(`Message from ${phone} requires admin follow up`);
         }
       }
 
+      if (typingPresence) {
+        await typingPresence.stop();
+        typingPresence = null;
+      }
+
       return inboundMessage;
     } catch (error) {
+      if (typingPresence) {
+        await typingPresence.stop();
+        typingPresence = null;
+      }
+
       logger.error('Error processing message:', error);
 
       if (inboundMessage) {

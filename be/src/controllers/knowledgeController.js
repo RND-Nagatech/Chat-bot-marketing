@@ -97,12 +97,15 @@ exports.activateDocument = async (req, res) => {
 };
 
 exports.getStatus = async (req, res) => {
-  const lmStudio = await lmStudioService.getStatus();
+  const llm = await lmStudioService.getStatus();
+  const vectorStore = await ragService.getVectorStoreStatus();
   res.json({
     success: true,
     data: {
       rag_enabled: ragService.isEnabled(),
-      lm_studio: lmStudio
+      llm,
+      lm_studio: llm,
+      vector_store: vectorStore
     }
   });
 };

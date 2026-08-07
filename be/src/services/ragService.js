@@ -8,6 +8,7 @@ const { recognize } = require('tesseract.js');
 const KnowledgeDocument = require('../models/KnowledgeDocument');
 const KnowledgeChunk = require('../models/KnowledgeChunk');
 const lmStudioService = require('./lmStudioService');
+const qdrantService = require('./qdrantService');
 const logger = require('../utils/logger');
 
 const execFileAsync = promisify(execFile);
@@ -284,11 +285,12 @@ class RAGService {
       }
 
       await KnowledgeChunk.deleteMany({ document_id: document._id });
+      await qdrantService.deleteDocumentPoints(document._id);
 
+      const chunksWithEmbedding = [];
       for (let index = 0; index < chunks.length; index += 1) {
         const embedding = await lmStudioService.createEmbedding(chunks[index]);
-        await KnowledgeChunk.create({
-          document_id: document._id,
+        chunksWithEmbedding.push({
           chunk_index: index,
           text: chunks[index],
           embedding
@@ -300,6 +302,26 @@ class RAGService {
       document.indexed_at = new Date();
       document.error_message = null;
       await document.save();
+
+      if (qdrantService.enabled) {
+        const points = await qdrantService.upsertChunks(document, chunksWithEmbedding);
+        await KnowledgeChunk.insertMany(chunksWithEmbedding.map((chunk, index) => ({
+          document_id: document._id,
+          chunk_index: chunk.chunk_index,
+          text: chunk.text,
+          vector_store: 'qdrant',
+          qdrant_point_id: points[index]?.id || qdrantService.pointId(document._id, chunk.chunk_index)
+        })));
+      } else {
+        await KnowledgeChunk.insertMany(chunksWithEmbedding.map((chunk) => ({
+          document_id: document._id,
+          chunk_index: chunk.chunk_index,
+          text: chunk.text,
+          embedding: chunk.embedding,
+          vector_store: 'mongo'
+        })));
+      }
+
       return document;
     } catch (error) {
       document.status = 'failed';
@@ -351,6 +373,11 @@ class RAGService {
     }
     document.status_active = true;
     await document.save();
+    try {
+      await qdrantService.setDocumentActive(document._id, true);
+    } catch (error) {
+      logger.warn('Failed to sync inactive knowledge state to Qdrant:', error.message);
+    }
     return document;
   }
 
@@ -361,6 +388,11 @@ class RAGService {
     }
     document.status_active = false;
     await document.save();
+    try {
+      await qdrantService.setDocumentActive(document._id, false);
+    } catch (error) {
+      logger.warn('Failed to sync active knowledge state to Qdrant:', error.message);
+    }
     return document;
   }
 
@@ -373,6 +405,25 @@ class RAGService {
     const memoryText = this.formatConversationMemory(conversationMemory);
     const queryText = memoryText ? `${memoryText}\n\nPertanyaan terbaru:\n${question}` : question;
     const queryEmbedding = await lmStudioService.createEmbedding(queryText);
+
+    if (qdrantService.enabled) {
+      const points = await qdrantService.search(queryEmbedding, this.topK);
+      return points
+        .map((point) => ({
+          _id: point.id,
+          text: point.payload?.text || '',
+          score: point.score || 0,
+          chunk_index: point.payload?.chunk_index,
+          document_id: {
+            _id: point.payload?.document_id,
+            title: point.payload?.document_title || 'Knowledge',
+            status: point.payload?.document_status || 'indexed',
+            status_active: point.payload?.status_active
+          }
+        }))
+        .filter((chunk) => chunk.text);
+    }
+
     const chunks = await KnowledgeChunk.find()
       .populate('document_id', 'title status status_active')
       .lean();
@@ -385,6 +436,10 @@ class RAGService {
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, this.topK);
+  }
+
+  async getVectorStoreStatus() {
+    return qdrantService.getStatus();
   }
 
   formatConversationMemory(messages = []) {
@@ -492,7 +547,13 @@ class RAGService {
       };
     } catch (error) {
       logger.error('RAG answer generation failed:', error);
-      return null;
+      return {
+        text: this.fallbackReply(),
+        shouldSend: true,
+        needsAdminFollowUp: true,
+        confidence: 0,
+        source: 'rag_error'
+      };
     }
   }
 }
