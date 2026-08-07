@@ -282,6 +282,14 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
     () => documents.filter((document) => document.status_active !== true).length,
     [documents]
   );
+  const llmStatus = status?.llm || status?.lm_studio;
+  const chatProviderLabel = llmStatus?.chat_provider === "deepseek" ? "DeepSeek" : "LM Studio";
+  const chatConnected = llmStatus?.chat_connected ?? llmStatus?.connected;
+  const embeddingConnected = llmStatus?.embedding_connected ?? llmStatus?.connected;
+  const embeddingProviderLabel = llmStatus?.embedding_provider === "local_hash" ? "Lokal" : "Eksternal";
+  const vectorStore = status?.vector_store;
+  const vectorStoreLabel = vectorStore?.provider === "qdrant" ? "Qdrant" : "MongoDB";
+  const vectorStoreConnected = vectorStore?.connected ?? true;
 
   const handleUpload = async () => {
     if (!selectedFile) {
@@ -410,13 +418,22 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
         </div>
         <div className="rounded-lg border bg-card p-4">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            {status?.lm_studio.connected ? <Wifi className="h-4 w-4 text-primary" /> : <WifiOff className="h-4 w-4 text-destructive" />}
-            LM Studio
+            {chatConnected ? <Wifi className="h-4 w-4 text-primary" /> : <WifiOff className="h-4 w-4 text-destructive" />}
+            {chatProviderLabel}
           </div>
           <div className="mt-2 text-sm font-medium text-foreground">
-            {status?.lm_studio.connected ? "Terhubung" : "Tidak terhubung"}
+            {chatConnected ? "Chat terhubung" : "Chat tidak terhubung"}
           </div>
-          <div className="mt-1 truncate text-xs text-muted-foreground">{status?.lm_studio.base_url || "Memuat..."}</div>
+          <div className="mt-1 truncate text-xs text-muted-foreground">{llmStatus?.chat_base_url || llmStatus?.base_url || "Memuat..."}</div>
+          <div className={`mt-2 text-xs font-medium ${embeddingConnected ? "text-primary" : "text-destructive"}`}>
+            Embedding {embeddingProviderLabel} {embeddingConnected ? "aktif" : "tidak aktif"}
+          </div>
+          <div className={`mt-1 text-xs font-medium ${vectorStoreConnected ? "text-primary" : "text-destructive"}`}>
+            Vector {vectorStoreLabel} {vectorStoreConnected ? "aktif" : "tidak aktif"}
+          </div>
+          {vectorStore?.collection && (
+            <div className="mt-1 truncate text-xs text-muted-foreground">{vectorStore.collection}</div>
+          )}
         </div>
       </div>
 

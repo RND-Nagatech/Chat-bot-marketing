@@ -80,11 +80,41 @@ export interface KnowledgeDocument {
 
 export interface KnowledgeStatus {
   rag_enabled: boolean;
+  llm?: {
+    connected: boolean;
+    chat_provider?: string;
+    chat_connected?: boolean;
+    chat_base_url?: string;
+    chat_model: string;
+    embedding_provider?: string;
+    embedding_connected?: boolean;
+    embedding_base_url?: string;
+    embedding_model: string;
+    base_url: string;
+    error?: string;
+    chat_error?: string;
+    embedding_error?: string;
+  };
   lm_studio: {
     connected: boolean;
+    chat_provider?: string;
+    chat_connected?: boolean;
+    chat_base_url?: string;
     base_url: string;
     chat_model: string;
+    embedding_provider?: string;
+    embedding_connected?: boolean;
+    embedding_base_url?: string;
     embedding_model: string;
+    error?: string;
+  };
+  vector_store?: {
+    provider: "mongo" | "qdrant";
+    connected: boolean;
+    collection?: string | null;
+    base_url?: string | null;
+    vector_size?: number;
+    distance?: string;
     error?: string;
   };
 }
