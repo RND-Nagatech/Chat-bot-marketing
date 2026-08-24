@@ -12,6 +12,7 @@ router.post('/reply', messagesController.sendManualReply);
 router.post('/reply-image', messagesController.imageUploadMiddleware, messagesController.sendManualImageReply);
 router.post('/edit', messagesController.editMessage);
 router.post('/resolve-pending', messagesController.resolvePendingMessage);
+router.post('/resolve-pending/bulk', messagesController.resolvePendingMessages);
 router.post('/delete-for-me', messagesController.deleteMessageForMe);
 router.post('/delete-for-all', messagesController.deleteMessageForAll);
 router.get('/phone/:phone', messagesController.getMessagesByPhone);

@@ -1,5 +1,12 @@
 const logger = require('../utils/logger');
 
+let UndiciAgent = null;
+try {
+  ({ Agent: UndiciAgent } = require('undici'));
+} catch {
+  UndiciAgent = null;
+}
+
 class LMStudioService {
   get baseUrl() {
     return (process.env.EMBEDDING_BASE_URL || process.env.LM_STUDIO_BASE_URL || 'http://localhost:1234/v1').replace(/\/$/, '');
@@ -47,6 +54,25 @@ class LMStudioService {
     return Number.isFinite(configured) && configured > 0 ? configured : 30000;
   }
 
+  get retryCount() {
+    const configured = Number(process.env.LLM_RETRIES);
+    return Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : 2;
+  }
+
+  get retryDelayMs() {
+    const configured = Number(process.env.LLM_RETRY_DELAY_MS);
+    return Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : 1000;
+  }
+
+  get dispatcher() {
+    if (!UndiciAgent) return undefined;
+    return new UndiciAgent({
+      connect: { timeout: this.timeoutMs },
+      headersTimeout: this.timeoutMs,
+      bodyTimeout: this.timeoutMs
+    });
+  }
+
   get chatMaxTokens() {
     const configured = Number(process.env.LLM_CHAT_MAX_TOKENS);
     return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 2400;
@@ -57,7 +83,11 @@ class LMStudioService {
     return Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : 2;
   }
 
-  async request(url, payload, headers = {}) {
+  sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async requestOnce(url, payload, headers = {}) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
@@ -66,7 +96,8 @@ class LMStudioService {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...headers },
         body: JSON.stringify(payload),
-        signal: controller.signal
+        signal: controller.signal,
+        dispatcher: this.dispatcher
       });
 
       const data = await response.json().catch(() => ({}));
@@ -83,6 +114,32 @@ class LMStudioService {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  async request(url, payload, headers = {}) {
+    const maxAttempts = this.retryCount + 1;
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await this.requestOnce(url, payload, headers);
+      } catch (error) {
+        lastError = error;
+        if (attempt >= maxAttempts) {
+          break;
+        }
+
+        const statusMessage = error?.message || '';
+        if (/status\s+4\d\d/i.test(statusMessage) && !/429/.test(statusMessage)) {
+          break;
+        }
+
+        logger.warn(`LLM request attempt ${attempt} failed: ${error.message}`);
+        await this.sleep(this.retryDelayMs * attempt);
+      }
+    }
+
+    throw lastError;
   }
 
   hashToken(token) {

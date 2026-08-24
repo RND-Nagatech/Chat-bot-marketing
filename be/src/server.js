@@ -28,18 +28,14 @@ if (!fs.existsSync(authInfoDir)) {
   fs.mkdirSync(authInfoDir, { recursive: true });
 }
 
-const hasStoredWhatsAppSession = () => {
-  const credsPath = path.join(authInfoDir, 'creds.json');
-  return fs.existsSync(credsPath);
-};
-
 app.use('/api', routes);
 
 app.get('/health', (req, res) => {
   res.json({
     success: true,
     message: 'Server is running',
-    whatsapp_status: whatsappService.getStatus().status
+    whatsapp_status: 'multi-session',
+    whatsapp_connected_count: whatsappService.getConnectedCount()
   });
 });
 
@@ -65,13 +61,9 @@ const startServer = async () => {
     await connectDB();
     await messageService.applyHybridRetentionPolicy();
 
-    const shouldAutoConnect =
-      process.env.AUTO_CONNECT_WHATSAPP === 'true' || hasStoredWhatsAppSession();
-
-    if (shouldAutoConnect) {
-      logger.info('Attempting automatic WhatsApp connection...');
-      await whatsappService.connect();
-    }
+    logger.info('Checking stored WhatsApp user sessions...');
+    const attempted = await whatsappService.connectStoredSessions();
+    logger.info(`Automatic WhatsApp connection attempted for ${attempted} stored session(s)`);
 
     const server = app.listen(PORT, () => {
       logger.info(`Server is running on port ${PORT}`);

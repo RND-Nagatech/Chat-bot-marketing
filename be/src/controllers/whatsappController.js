@@ -2,10 +2,16 @@ const whatsappService = require('../services/whatsappService');
 const WhatsAppSession = require('../models/WhatsAppSession');
 const logger = require('../utils/logger');
 
+const getOwnerUserId = (req) => {
+  const salesId = req.user?.kode_sales || req.user?.salesId || req.user?.userId;
+  return salesId ? String(salesId) : null;
+};
+
 exports.getStatus = async (req, res) => {
   try {
-    const runtime = whatsappService.getStatus();
-    const session = await WhatsAppSession.findOne();
+    const ownerUserId = getOwnerUserId(req);
+    const runtime = whatsappService.getStatus(ownerUserId);
+    const session = await WhatsAppSession.findOne({ owner_user_id: ownerUserId });
 
     const currentStatus = runtime.status;
     const currentQr = runtime.qrCode;
@@ -16,7 +22,7 @@ exports.getStatus = async (req, res) => {
 
     if (runtime.status === 'disconnected' && session && ['connecting', 'qr_ready', 'authorizing'].includes(session.status)) {
       await WhatsAppSession.findOneAndUpdate(
-        {},
+        { owner_user_id: ownerUserId },
         { status: 'disconnected', qr_code: null, phone_number: null, last_error: currentError },
         { upsert: true }
       );
@@ -42,8 +48,9 @@ exports.getStatus = async (req, res) => {
 
 exports.getQRCode = async (req, res) => {
   try {
-    const status = whatsappService.getStatus();
-    const qrCode = whatsappService.getQRCode();
+    const ownerUserId = getOwnerUserId(req);
+    const status = whatsappService.getStatus(ownerUserId);
+    const qrCode = whatsappService.getQRCode(ownerUserId);
     const currentStatus = status.status;
 
     if (currentStatus !== 'qr_ready' || !qrCode) {
@@ -70,7 +77,8 @@ exports.getQRCode = async (req, res) => {
 
 exports.connect = async (req, res) => {
   try {
-    const status = whatsappService.getStatus().status;
+    const ownerUserId = getOwnerUserId(req);
+    const status = whatsappService.getStatus(ownerUserId).status;
     if (['connecting', 'qr_ready', 'authorizing', 'connected'].includes(status)) {
       return res.status(200).json({
         success: false,
@@ -79,13 +87,13 @@ exports.connect = async (req, res) => {
       });
     }
 
-    await whatsappService.connect();
+    await whatsappService.connect(ownerUserId);
 
     res.json({
       success: true,
       message: 'WhatsApp connection initiated. Scan QR code to continue.',
       data: {
-        status: whatsappService.getStatus().status
+        status: whatsappService.getStatus(ownerUserId).status
       }
     });
   } catch (error) {
@@ -99,14 +107,15 @@ exports.connect = async (req, res) => {
 
 exports.disconnect = async (req, res) => {
   try {
-    if (!['connected', 'connecting', 'qr_ready', 'authorizing'].includes(whatsappService.getStatus().status)) {
+    const ownerUserId = getOwnerUserId(req);
+    if (!['connected', 'connecting', 'qr_ready', 'authorizing'].includes(whatsappService.getStatus(ownerUserId).status)) {
       return res.status(400).json({
         success: false,
         message: 'WhatsApp is not connected'
       });
     }
 
-    await whatsappService.disconnect();
+    await whatsappService.disconnect(ownerUserId);
 
     res.json({
       success: true,
@@ -123,13 +132,14 @@ exports.disconnect = async (req, res) => {
 
 exports.refreshQRCode = async (req, res) => {
   try {
-    await whatsappService.refreshQRCode();
+    const ownerUserId = getOwnerUserId(req);
+    await whatsappService.refreshQRCode(ownerUserId);
 
     res.json({
       success: true,
       message: 'QR code refresh initiated',
       data: {
-        status: whatsappService.getStatus().status
+        status: whatsappService.getStatus(ownerUserId).status
       }
     });
   } catch (error) {
@@ -143,13 +153,14 @@ exports.refreshQRCode = async (req, res) => {
 
 exports.reconnect = async (req, res) => {
   try {
-    await whatsappService.restartPairing();
+    const ownerUserId = getOwnerUserId(req);
+    await whatsappService.restartPairing(ownerUserId);
 
     res.json({
       success: true,
       message: 'WhatsApp pairing restart initiated',
       data: {
-        status: whatsappService.getStatus().status
+        status: whatsappService.getStatus(ownerUserId).status
       }
     });
   } catch (error) {

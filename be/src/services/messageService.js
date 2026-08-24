@@ -2,9 +2,75 @@ const Message = require('../models/Message');
 const mongoose = require('mongoose');
 const rulesEngine = require('./rulesEngine');
 const ragService = require('./ragService');
+const leadCaptureService = require('./leadCaptureService');
 const logger = require('../utils/logger');
 
 class MessageService {
+  constructor() {
+    this.phoneProcessingQueue = new Map();
+    this.recentInboundKeys = new Map();
+  }
+
+  cleanupRecentInboundKeys() {
+    const ttlMs = 2 * 60 * 1000;
+    const now = Date.now();
+
+    for (const [key, createdAt] of this.recentInboundKeys.entries()) {
+      if (now - createdAt > ttlMs) {
+        this.recentInboundKeys.delete(key);
+      }
+    }
+  }
+
+  normalizeOwnerUserId(ownerUserId) {
+    return ownerUserId ? String(ownerUserId) : null;
+  }
+
+  getOwnerQuery(ownerUserId) {
+    const normalized = this.normalizeOwnerUserId(ownerUserId);
+    return normalized ? { pemilik_pengguna_id: normalized } : {};
+  }
+
+  getInboundDedupKey(phone, normalizedText, incomingMessageId = null, ownerUserId = null) {
+    const ownerKey = this.normalizeOwnerUserId(ownerUserId) || 'global';
+    if (incomingMessageId) {
+      return `${ownerKey}:wa:${incomingMessageId}`;
+    }
+
+    const normalizedFallbackText = normalizedText.toLowerCase().replace(/\s+/g, ' ');
+    const bucket = Math.floor(Date.now() / 8000);
+    return `${ownerKey}:text:${phone}:${normalizedFallbackText}:${bucket}`;
+  }
+
+  shouldIgnoreRecentInbound(dedupKey) {
+    this.cleanupRecentInboundKeys();
+
+    if (this.recentInboundKeys.has(dedupKey)) {
+      return true;
+    }
+
+    this.recentInboundKeys.set(dedupKey, Date.now());
+    return false;
+  }
+
+  async runQueuedByPhone(phone, task, ownerUserId = null) {
+    const queueKey = `${this.normalizeOwnerUserId(ownerUserId) || 'global'}:${phone}`;
+    const previous = this.phoneProcessingQueue.get(queueKey) || Promise.resolve();
+    const queued = previous
+      .catch(() => {})
+      .then(task);
+
+    this.phoneProcessingQueue.set(queueKey, queued);
+
+    try {
+      return await queued;
+    } finally {
+      if (this.phoneProcessingQueue.get(queueKey) === queued) {
+        this.phoneProcessingQueue.delete(queueKey);
+      }
+    }
+  }
+
   extractDisplayText(message) {
     if (message?.is_revoked) {
       return 'Pesan ini dihapus';
@@ -158,7 +224,38 @@ class MessageService {
   }
 
   shouldSaveInboundImageKnowledge() {
-    return process.env.WA_IMAGE_SAVE_TO_KNOWLEDGE !== 'false';
+    return process.env.WA_IMAGE_SAVE_TO_KNOWLEDGE === 'true';
+  }
+
+  normalizePhoneForEnv(value = '') {
+    return (value || '').toString().replace(/\D/g, '');
+  }
+
+  getAllowedImageKnowledgePhones() {
+    return (process.env.WA_IMAGE_KNOWLEDGE_ALLOWED_PHONES || '')
+      .split(',')
+      .map((phone) => this.normalizePhoneForEnv(phone))
+      .filter(Boolean);
+  }
+
+  canSaveInboundImageKnowledge(phone) {
+    if (!this.shouldSaveInboundImageKnowledge()) {
+      return false;
+    }
+
+    const normalizedPhone = this.normalizePhoneForEnv(phone);
+    const allowedPhones = this.getAllowedImageKnowledgePhones();
+
+    if (!allowedPhones.length) {
+      logger.warn('Inbound image knowledge save is enabled, but WA_IMAGE_KNOWLEDGE_ALLOWED_PHONES is empty. Image will not be saved as knowledge.');
+      return false;
+    }
+
+    return allowedPhones.includes(normalizedPhone);
+  }
+
+  isQuickAnswersEnabled() {
+    return process.env.QUICK_ANSWERS_ENABLED === 'true';
   }
 
   isDeleteForEveryoneAllowed(message) {
@@ -191,8 +288,9 @@ class MessageService {
     return nowSec - messageSec <= this.getEditWindowSeconds();
   }
 
-  async getConversationMemory(phone, excludeWaMessageId = null, limit = ragService.memoryLimit) {
+  async getConversationMemory(phone, excludeWaMessageId = null, limit = ragService.memoryLimit, ownerUserId = null) {
     const query = {
+      ...this.getOwnerQuery(ownerUserId),
       phone,
       deleted_for_admin: { $ne: true },
       deleted_for_all_at: null,
@@ -209,8 +307,7 @@ class MessageService {
 
     const messages = await Message.find(query)
       .sort({ createdAt: -1 })
-      .limit(limit)
-      .lean();
+      .limit(limit);
 
     return messages.reverse().map((message) => ({
       role: message.direction === 'inbound' ? 'user' : 'assistant',
@@ -220,7 +317,7 @@ class MessageService {
 
   async saveInboundImageAsKnowledge(phone, imageText, waMessageId = null) {
     const normalizedText = (imageText || '').trim();
-    if (!this.shouldSaveInboundImageKnowledge() || normalizedText.length < 20) {
+    if (!this.canSaveInboundImageKnowledge(phone) || normalizedText.length < 20) {
       return null;
     }
 
@@ -241,12 +338,31 @@ class MessageService {
   }
 
   async processMessage(phone, messageText, whatsappSocket, replyJid = phone, options = {}) {
+    const normalizedText = (messageText || '').trim();
+    if (!normalizedText) return null;
+
+    const ownerUserId = this.normalizeOwnerUserId(options?.ownerUserId);
+    const incomingMessageId = options?.incomingKey?.id || null;
+    const dedupKey = this.getInboundDedupKey(phone, normalizedText, incomingMessageId, ownerUserId);
+
+    if (this.shouldIgnoreRecentInbound(dedupKey)) {
+      logger.info(`Duplicate/rapid inbound event ignored before processing (phone=${phone}, wa_message_id=${incomingMessageId || 'none'})`);
+      return null;
+    }
+
+    return this.runQueuedByPhone(phone, () => (
+      this.processMessageCore(phone, normalizedText, whatsappSocket, replyJid, options)
+    ), ownerUserId);
+  }
+
+  async processMessageCore(phone, messageText, whatsappSocket, replyJid = phone, options = {}) {
     let inboundMessage = null;
     let typingPresence = null;
     const incomingKey = options?.incomingKey || null;
     const incomingRemoteJid = options?.incomingRemoteJid || replyJid || null;
     const incomingMessageId = incomingKey?.id || null;
     const quotedWaMessageId = options?.quotedWaMessageId || null;
+    const ownerUserId = this.normalizeOwnerUserId(options?.ownerUserId);
 
     try {
       const normalizedText = (messageText || '').trim();
@@ -255,7 +371,7 @@ class MessageService {
       // Idempotency guard: WA can emit duplicate upserts for the same message key.
       if (incomingMessageId) {
         const existingInbound = await Message.findOne({
-          phone,
+          ...this.getOwnerQuery(ownerUserId),
           wa_message_id: incomingMessageId,
           direction: 'inbound',
           sender_type: 'customer'
@@ -269,10 +385,13 @@ class MessageService {
 
       typingPresence = this.startTypingPresence(whatsappSocket, replyJid);
 
-      const matchedRule = await rulesEngine.matchRule(messageText);
+      const matchedRule = this.isQuickAnswersEnabled()
+        ? await rulesEngine.matchRule(messageText)
+        : null;
       const hasMatchedRule = Boolean(matchedRule);
 
       inboundMessage = new Message({
+        owner_user_id: ownerUserId,
         phone,
         message_in: normalizedText,
         message_out: null,
@@ -304,7 +423,14 @@ class MessageService {
         await this.saveInboundImageAsKnowledge(phone, options.imageKnowledgeText, incomingMessageId);
       }
 
-      const sendBotReply = async ({ responseText, matchedRuleId = null, needsAdminFollowUp = false, logSource = 'bot' }) => {
+      const sendBotReply = async ({
+        responseText,
+        matchedRuleId = null,
+        needsAdminFollowUp = false,
+        followUp = null,
+        aiTraceRunId = null,
+        logSource = 'bot'
+      }) => {
         try {
           if (typingPresence) {
             await typingPresence.stop();
@@ -313,6 +439,7 @@ class MessageService {
           const sent = await whatsappSocket.sendMessage(replyJid, { text: responseText });
 
           const outboundMessage = new Message({
+            owner_user_id: ownerUserId,
             phone,
             message_in: null,
             message_out: responseText,
@@ -327,6 +454,7 @@ class MessageService {
             wa_participant: sent?.key?.participant || null,
             wa_from_me: sent?.key?.fromMe ?? true,
             wa_message_timestamp: sent?.messageTimestamp || null,
+            ai_trace_run_id: aiTraceRunId,
             expires_at: this.getExpiresAt()
           });
 
@@ -334,14 +462,32 @@ class MessageService {
 
           if (!needsAdminFollowUp) {
             await Message.updateOne(
-              { _id: inboundMessage._id },
+              { _id: inboundMessage._id, ...this.getOwnerQuery(ownerUserId) },
               {
                 $set: {
                   status: 'handled_by_bot',
                   follow_up_state: 'resolved',
                   follow_up_resolved_at: new Date(),
                   follow_up_resolved_by: 'bot',
+                  follow_up_category: null,
+                  follow_up_reason: null,
+                  follow_up_summary: null,
+                  ai_trace_run_id: aiTraceRunId,
                   expires_at: this.getExpiresAt()
+                }
+              }
+            );
+          } else {
+            await Message.updateOne(
+              { _id: inboundMessage._id, ...this.getOwnerQuery(ownerUserId) },
+              {
+                $set: {
+                  status: 'needs_admin_follow_up',
+                  follow_up_state: 'open',
+                  follow_up_category: followUp?.category || null,
+                  follow_up_reason: followUp?.reason || null,
+                  follow_up_summary: followUp?.summary || null,
+                  ai_trace_run_id: aiTraceRunId
                 }
               }
             );
@@ -351,6 +497,7 @@ class MessageService {
           return outboundMessage;
         } catch (sendError) {
           await Message.create({
+            owner_user_id: ownerUserId,
             phone,
             message_in: null,
             message_out: responseText,
@@ -369,17 +516,22 @@ class MessageService {
             wa_participant: null,
             wa_from_me: true,
             wa_message_timestamp: null,
+            ai_trace_run_id: aiTraceRunId,
             expires_at: this.getExpiresAt()
           });
 
           await Message.updateOne(
-            { _id: inboundMessage._id },
+            { _id: inboundMessage._id, ...this.getOwnerQuery(ownerUserId) },
             {
               $set: {
                 status: 'needs_admin_follow_up',
                 follow_up_state: 'open',
                 follow_up_resolved_at: null,
-                follow_up_resolved_by: null
+                follow_up_resolved_by: null,
+                follow_up_category: followUp?.category || 'send_failed',
+                follow_up_reason: followUp?.reason || sendError.message,
+                follow_up_summary: followUp?.summary || responseText,
+                ai_trace_run_id: aiTraceRunId
               }
             }
           );
@@ -388,7 +540,7 @@ class MessageService {
         }
       };
 
-      if (hasMatchedRule) {
+      if (this.isQuickAnswersEnabled() && hasMatchedRule) {
         await sendBotReply({
           responseText: matchedRule.response,
           matchedRuleId: matchedRule._id,
@@ -396,24 +548,47 @@ class MessageService {
           logSource: 'rule'
         });
       } else {
-        const conversationMemory = await this.getConversationMemory(phone, incomingMessageId);
-        const ragAnswer = await ragService.generateAnswer(normalizedText, { conversationMemory });
+        const conversationMemory = await this.getConversationMemory(phone, incomingMessageId, ragService.memoryLimit, ownerUserId);
+        const ragAnswer = await ragService.generateAnswer(normalizedText, {
+          conversationMemory,
+          phone,
+          messageId: inboundMessage._id,
+          waMessageId: incomingMessageId
+        });
         if (ragAnswer?.shouldSend && ragAnswer.text) {
           await sendBotReply({
             responseText: ragAnswer.text,
             matchedRuleId: null,
             needsAdminFollowUp: ragAnswer.needsAdminFollowUp,
+            followUp: ragAnswer.followUp,
+            aiTraceRunId: ragAnswer.traceRunId,
             logSource: ragAnswer.source || 'rag'
           });
 
           if (ragAnswer.needsAdminFollowUp) {
             logger.info(`RAG response sent to ${phone}, message remains open for admin follow up`);
           }
+
+        await leadCaptureService.captureFromConversation({
+            ownerUserId,
+            phone,
+            sourceMessageId: inboundMessage._id,
+            waMessageId: incomingMessageId,
+            aiTraceRunId: ragAnswer.traceRunId,
+            question: normalizedText,
+            answer: ragAnswer.text,
+            conversationMemory
+          });
         } else {
           await sendBotReply({
             responseText: ragService.fallbackReply(),
             matchedRuleId: null,
             needsAdminFollowUp: true,
+            followUp: {
+              category: 'rag_unavailable',
+              reason: 'RAG tidak menghasilkan jawaban.',
+              summary: normalizedText
+            },
             logSource: 'rag_unavailable'
           });
           logger.info(`Message from ${phone} requires admin follow up`);
@@ -439,6 +614,7 @@ class MessageService {
       }
 
       const failedMessage = new Message({
+        owner_user_id: ownerUserId,
         phone,
         message_in: messageText,
         message_out: null,
@@ -467,8 +643,9 @@ class MessageService {
     }
   }
 
-  async resolveReplyJidByPhone(phone) {
+  async resolveReplyJidByPhone(phone, ownerUserId = null) {
     const latestWithJid = await Message.findOne({
+      ...this.getOwnerQuery(ownerUserId),
       phone,
       wa_jid: { $ne: null }
     }).sort({ createdAt: -1 });
@@ -481,7 +658,8 @@ class MessageService {
     if (!normalizedText) {
       throw new Error('Pesan balasan tidak boleh kosong');
     }
-    const { replyToMessageId = null, resolvedBy = null } = options;
+    const { replyToMessageId = null, resolvedBy = null, ownerUserId: rawOwnerUserId = null } = options;
+    const ownerUserId = this.normalizeOwnerUserId(rawOwnerUserId);
 
     let replyTargetMessage = null;
     let pendingTargetMessage = null;
@@ -492,6 +670,7 @@ class MessageService {
       }
 
       replyTargetMessage = await Message.findOne({
+        ...this.getOwnerQuery(ownerUserId),
         _id: replyToMessageId,
         phone,
         $or: [
@@ -507,6 +686,7 @@ class MessageService {
       }
 
       pendingTargetMessage = await Message.findOne({
+        ...this.getOwnerQuery(ownerUserId),
         _id: replyToMessageId,
         phone,
         message_in: { $ne: null },
@@ -533,7 +713,7 @@ class MessageService {
       });
     }
 
-    const replyJid = await this.resolveReplyJidByPhone(phone);
+    const replyJid = await this.resolveReplyJidByPhone(phone, ownerUserId);
 
     try {
       const quoted =
@@ -552,12 +732,14 @@ class MessageService {
           : undefined;
 
       const sent = await whatsappService.sendMessage(
+        ownerUserId,
         replyJid,
         normalizedText,
         quoted ? { quoted } : undefined
       );
 
       const outboundMessage = new Message({
+        owner_user_id: ownerUserId,
         phone,
         message_in: null,
         message_out: normalizedText,
@@ -583,7 +765,7 @@ class MessageService {
 
       if (pendingTargetMessage) {
         await Message.updateOne(
-          { _id: pendingTargetMessage._id },
+          { _id: pendingTargetMessage._id, ...this.getOwnerQuery(ownerUserId) },
           {
             $set: {
               follow_up_state: 'resolved',
@@ -601,6 +783,7 @@ class MessageService {
       return outboundMessage;
     } catch (error) {
       const failedOutboundMessage = new Message({
+        owner_user_id: ownerUserId,
         phone,
         message_in: null,
         message_out: normalizedText,
@@ -635,7 +818,8 @@ class MessageService {
 
     const normalizedCaption = (caption || '').trim();
     const displayText = normalizedCaption ? `[Gambar] ${normalizedCaption}` : '[Gambar]';
-    const { replyToMessageId = null, resolvedBy = null } = options;
+    const { replyToMessageId = null, resolvedBy = null, ownerUserId: rawOwnerUserId = null } = options;
+    const ownerUserId = this.normalizeOwnerUserId(rawOwnerUserId);
 
     let replyTargetMessage = null;
     let pendingTargetMessage = null;
@@ -646,6 +830,7 @@ class MessageService {
       }
 
       replyTargetMessage = await Message.findOne({
+        ...this.getOwnerQuery(ownerUserId),
         _id: replyToMessageId,
         phone,
         $or: [
@@ -661,6 +846,7 @@ class MessageService {
       }
 
       pendingTargetMessage = await Message.findOne({
+        ...this.getOwnerQuery(ownerUserId),
         _id: replyToMessageId,
         phone,
         message_in: { $ne: null },
@@ -687,7 +873,7 @@ class MessageService {
       });
     }
 
-    const replyJid = await this.resolveReplyJidByPhone(phone);
+    const replyJid = await this.resolveReplyJidByPhone(phone, ownerUserId);
 
     try {
       const quoted =
@@ -706,6 +892,7 @@ class MessageService {
           : undefined;
 
       const sent = await whatsappService.sendImageMessage(
+        ownerUserId,
         replyJid,
         imageBuffer,
         normalizedCaption,
@@ -713,6 +900,7 @@ class MessageService {
       );
 
       const outboundMessage = new Message({
+        owner_user_id: ownerUserId,
         phone,
         message_in: null,
         message_out: displayText,
@@ -738,7 +926,7 @@ class MessageService {
 
       if (pendingTargetMessage) {
         await Message.updateOne(
-          { _id: pendingTargetMessage._id },
+          { _id: pendingTargetMessage._id, ...this.getOwnerQuery(ownerUserId) },
           {
             $set: {
               follow_up_state: 'resolved',
@@ -755,6 +943,7 @@ class MessageService {
       return outboundMessage;
     } catch (error) {
       const failedOutboundMessage = new Message({
+        owner_user_id: ownerUserId,
         phone,
         message_in: null,
         message_out: displayText,
@@ -782,50 +971,61 @@ class MessageService {
     }
   }
 
-  async getAllMessages(limit = 100, skip = 0) {
-    return await Message.find()
-      .populate('matched_rule')
+  async getAllMessages(limit = 100, skip = 0, ownerUserId = null) {
+    return await Message.find(this.getOwnerQuery(ownerUserId))
+      .populate('aturan.cocok')
       .sort({ createdAt: -1 })
       .limit(limit)
       .skip(skip);
   }
 
-  async getMessagesByPhone(phone, limit = 50) {
-    return await Message.find({ phone })
-      .populate('matched_rule')
+  async getMessagesByPhone(phone, limit = 50, ownerUserId = null) {
+    return await Message.find({ ...this.getOwnerQuery(ownerUserId), phone })
+      .populate('aturan.cocok')
       .sort({ createdAt: -1 })
       .limit(limit);
   }
 
-  async getMessagesCount() {
-    return await Message.countDocuments();
+  async getMessagesCount(ownerUserId = null) {
+    return await Message.countDocuments(this.getOwnerQuery(ownerUserId));
   }
 
-  async getConversations() {
-    const rows = await Message.aggregate([
+  async getConversations(ownerUserId = null, options = {}) {
+    const page = Number.isFinite(Number(options.page)) && Number(options.page) > 0
+      ? Math.floor(Number(options.page))
+      : 1;
+    const limit = Number.isFinite(Number(options.limit)) && Number(options.limit) > 0
+      ? Math.min(Math.floor(Number(options.limit)), 100)
+      : 10;
+    const skip = (page - 1) * limit;
+    const search = String(options.search || '').trim();
+    const searchRegex = search ? new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') : null;
+
+    const pipeline = [
       {
         $match: {
-          deleted_for_admin: { $ne: true },
-          deleted_for_all_at: null
+          ...this.getOwnerQuery(ownerUserId),
+          'penghapusan.dihapus_untuk_admin': { $ne: true },
+          'penghapusan.dihapus_untuk_semua_pada': null
         }
       },
-      { $sort: { createdAt: -1 } },
+      { $sort: { dibuat_pada: -1 } },
       {
         $group: {
-          _id: '$phone',
+          _id: '$nomor_telepon',
           last_doc: { $first: '$$ROOT' },
           unresolved_count: {
             $sum: {
               $cond: [
                 {
                   $and: [
-                    { $eq: [{ $ifNull: ['$direction', 'inbound'] }, 'inbound'] },
+                    { $eq: [{ $ifNull: ['$pesan.arah', 'masuk'] }, 'masuk'] },
                     {
                       $or: [
-                        { $eq: ['$follow_up_state', 'open'] },
+                        { $eq: ['$tindak_lanjut.status', 'open'] },
                         {
                           $and: [
-                            { $eq: ['$follow_up_state', null] },
+                            { $eq: ['$tindak_lanjut.status', null] },
                             { $eq: ['$status', 'needs_admin_follow_up'] }
                           ]
                         }
@@ -846,40 +1046,79 @@ class MessageService {
           phone: '$_id',
           last_message: {
             $cond: [
-              { $eq: ['$last_doc.is_revoked', true] },
+              { $eq: ['$last_doc.pencabutan.sudah_dicabut', true] },
               'Pesan ini dihapus',
-              { $ifNull: ['$last_doc.message_out', '$last_doc.message_in'] }
+              { $ifNull: ['$last_doc.pesan.keluar', '$last_doc.pesan.masuk'] }
             ]
           },
-          last_message_at: '$last_doc.createdAt',
-          last_direction: { $ifNull: ['$last_doc.direction', 'inbound'] },
+          last_message_at: '$last_doc.dibuat_pada',
+          last_direction: {
+            $cond: [
+              { $eq: [{ $ifNull: ['$last_doc.pesan.arah', 'masuk'] }, 'keluar'] },
+              'outbound',
+              'inbound'
+            ]
+          },
           last_status: '$last_doc.status',
           unresolved_count: 1
         }
       },
-      { $sort: { last_message_at: -1 } }
-    ]);
+      ...(searchRegex
+        ? [{
+            $match: {
+              $or: [
+                { phone: searchRegex },
+                { last_message: searchRegex }
+              ]
+            }
+          }]
+        : []),
+      { $sort: { last_message_at: -1 } },
+      {
+        $facet: {
+          data: [
+            { $skip: skip },
+            { $limit: limit }
+          ],
+          meta: [
+            { $count: 'total' }
+          ]
+        }
+      }
+    ];
 
-    return rows.map((row) => ({
-      ...row,
-      last_message: (row.last_message || '').trim()
-    }));
+    const [result] = await Message.aggregate(pipeline);
+    const rows = result?.data || [];
+    const total = result?.meta?.[0]?.total || 0;
+
+    return {
+      data: rows.map((row) => ({
+        ...row,
+        last_message: (row.last_message || '').trim()
+      })),
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / limit))
+      }
+    };
   }
 
-  async getConversationByPhone(phone, limit = this.getThreadLimit()) {
+  async getConversationByPhone(phone, limit = this.getThreadLimit(), ownerUserId = null) {
     const normalizedLimit = Number.isFinite(Number(limit)) && Number(limit) > 0
       ? Math.min(Math.floor(Number(limit)), 500)
       : this.getThreadLimit();
 
     const messages = (await Message.find({
+      ...this.getOwnerQuery(ownerUserId),
       phone,
       deleted_for_admin: { $ne: true },
       deleted_for_all_at: null
     })
-      .populate('matched_rule')
+      .populate('aturan.cocok')
       .sort({ createdAt: -1 })
-      .limit(normalizedLimit)
-      .lean()).reverse();
+      .limit(normalizedLimit)).reverse();
 
     const expanded = [];
     const seenWAKey = new Set();
@@ -995,10 +1234,11 @@ class MessageService {
     return expanded;
   }
 
-  async markMessageRevokedByWa(phone, waMessageId, revokedBy = 'customer') {
+  async markMessageRevokedByWa(phone, waMessageId, revokedBy = 'customer', ownerUserId = null) {
     if (!phone || !waMessageId) return null;
 
     const target = await Message.findOne({
+      ...this.getOwnerQuery(ownerUserId),
       phone,
       wa_message_id: waMessageId,
       deleted_for_admin: { $ne: true },
@@ -1025,23 +1265,24 @@ class MessageService {
     return target;
   }
 
-  async backfillPhoneAlias(oldPhone, newPhone) {
+  async backfillPhoneAlias(oldPhone, newPhone, ownerUserId = null) {
     if (!oldPhone || !newPhone || oldPhone === newPhone) return 0;
 
     const result = await Message.updateMany(
-      { phone: oldPhone },
+      { ...this.getOwnerQuery(ownerUserId), phone: oldPhone },
       { $set: { phone: newPhone } }
     );
 
     return result?.modifiedCount || 0;
   }
 
-  async resolvePendingMessage(phone, messageId, resolvedBy = 'admin') {
+  async resolvePendingMessage(phone, messageId, resolvedBy = 'admin', ownerUserId = null) {
     if (!mongoose.Types.ObjectId.isValid(messageId)) {
       throw new Error('message_id tidak valid');
     }
 
     const message = await Message.findOne({
+      ...this.getOwnerQuery(ownerUserId),
       _id: messageId,
       phone,
       message_in: { $ne: null },
@@ -1072,12 +1313,66 @@ class MessageService {
     return message;
   }
 
-  async deleteMessageForMe(phone, messageId, deletedBy = 'admin', whatsappService) {
+  async resolvePendingMessages(phone, messageIds = [], resolvedBy = 'admin', ownerUserId = null) {
+    const ids = Array.isArray(messageIds)
+      ? [...new Set(messageIds.map((id) => String(id || '').trim()).filter(Boolean))]
+      : [];
+
+    for (const id of ids) {
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        throw new Error('message_ids berisi id tidak valid');
+      }
+    }
+
+    const query = {
+      ...this.getOwnerQuery(ownerUserId),
+      phone,
+      message_in: { $ne: null },
+      deleted_for_admin: { $ne: true },
+      deleted_for_all_at: null,
+      $or: [
+        { follow_up_state: 'open' },
+        {
+          $and: [
+            { follow_up_state: null },
+            { status: 'needs_admin_follow_up' }
+          ]
+        }
+      ]
+    };
+
+    if (ids.length > 0) {
+      query._id = { $in: ids };
+    }
+
+    const result = await Message.updateMany(query, {
+      $set: {
+        follow_up_state: 'resolved',
+        follow_up_resolved_at: new Date(),
+        follow_up_resolved_by: resolvedBy,
+        status: 'handled_by_bot',
+        expires_at: this.getExpiresAt()
+      }
+    });
+
+    return {
+      requestedCount: ids.length,
+      matchedCount: result?.matchedCount || 0,
+      modifiedCount: result?.modifiedCount || 0
+    };
+  }
+
+  async deleteMessageForMe(phone, messageId, deletedBy = 'admin', whatsappService, ownerUserId = null) {
     if (!mongoose.Types.ObjectId.isValid(messageId)) {
       throw new Error('message_id tidak valid');
     }
 
-    const target = await Message.findOne({ _id: messageId, phone, deleted_for_all_at: null });
+    const target = await Message.findOne({
+      ...this.getOwnerQuery(ownerUserId),
+      _id: messageId,
+      phone,
+      deleted_for_all_at: null
+    });
     if (!target) {
       throw new Error('Pesan tidak ditemukan');
     }
@@ -1093,6 +1388,7 @@ class MessageService {
     const messageTimestamp = target.wa_message_timestamp || Math.floor((target.createdAt?.getTime() || Date.now()) / 1000);
 
     await whatsappService.deleteMessageForMe(
+      this.normalizeOwnerUserId(ownerUserId),
       target.wa_remote_jid,
       {
         id: target.wa_message_id,
@@ -1104,7 +1400,7 @@ class MessageService {
     );
 
     const result = await Message.findOneAndUpdate(
-      { _id: messageId, phone, deleted_for_all_at: null },
+      { ...this.getOwnerQuery(ownerUserId), _id: messageId, phone, deleted_for_all_at: null },
       {
         $set: {
           deleted_for_admin: true,
@@ -1121,12 +1417,17 @@ class MessageService {
     return result;
   }
 
-  async deleteMessageForAll(phone, messageId, deletedBy = 'admin', whatsappService) {
+  async deleteMessageForAll(phone, messageId, deletedBy = 'admin', whatsappService, ownerUserId = null) {
     if (!mongoose.Types.ObjectId.isValid(messageId)) {
       throw new Error('message_id tidak valid');
     }
 
-    const target = await Message.findOne({ _id: messageId, phone, deleted_for_all_at: null });
+    const target = await Message.findOne({
+      ...this.getOwnerQuery(ownerUserId),
+      _id: messageId,
+      phone,
+      deleted_for_all_at: null
+    });
     if (!target) {
       throw new Error('Pesan tidak ditemukan');
     }
@@ -1148,6 +1449,7 @@ class MessageService {
     }
 
     await whatsappService.deleteMessageForEveryone(
+      this.normalizeOwnerUserId(ownerUserId),
       target.wa_remote_jid,
       {
         id: target.wa_message_id,
@@ -1158,7 +1460,7 @@ class MessageService {
     );
 
     const result = await Message.findOneAndUpdate(
-      { _id: messageId, phone, deleted_for_all_at: null },
+      { ...this.getOwnerQuery(ownerUserId), _id: messageId, phone, deleted_for_all_at: null },
       {
         $set: {
           deleted_for_all_at: new Date(),
@@ -1175,7 +1477,7 @@ class MessageService {
     return result;
   }
 
-  async editMessage(phone, messageId, newText, editedBy = 'admin', whatsappService) {
+  async editMessage(phone, messageId, newText, editedBy = 'admin', whatsappService, ownerUserId = null) {
     const normalized = (newText || '').trim();
     if (!normalized) {
       throw new Error('Pesan edit tidak boleh kosong');
@@ -1186,6 +1488,7 @@ class MessageService {
     }
 
     const target = await Message.findOne({
+      ...this.getOwnerQuery(ownerUserId),
       _id: messageId,
       phone,
       deleted_for_admin: { $ne: true },
@@ -1205,6 +1508,7 @@ class MessageService {
     }
 
     await whatsappService.editMessage(
+      this.normalizeOwnerUserId(ownerUserId),
       target.wa_remote_jid,
       {
         id: target.wa_message_id,

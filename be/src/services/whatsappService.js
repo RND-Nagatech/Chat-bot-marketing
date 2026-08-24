@@ -17,18 +17,44 @@ const WhatsAppSession = require('../models/WhatsAppSession');
 
 class WhatsAppService {
   constructor() {
-    this.sock = null;
-    this.qrCode = null;
-    this.status = 'disconnected';
-    this.lastError = null;
-    this.reconnectAttempts = 0;
+    this.sessions = new Map();
     this.maxReconnectAttempts = 5;
-    this.refreshInProgress = false;
-    this.manualDisconnect = false;
   }
 
-  get authInfoPath() {
+  get baseAuthInfoPath() {
     return path.join(process.cwd(), 'auth_info');
+  }
+
+  normalizeOwnerUserId(ownerUserId) {
+    return ownerUserId ? String(ownerUserId) : null;
+  }
+
+  getSessionKey(ownerUserId) {
+    return this.normalizeOwnerUserId(ownerUserId) || 'global';
+  }
+
+  getSafeAuthFolderName(ownerUserId) {
+    return this.getSessionKey(ownerUserId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  }
+
+  getAuthInfoPath(ownerUserId) {
+    return path.join(this.baseAuthInfoPath, this.getSafeAuthFolderName(ownerUserId));
+  }
+
+  getSessionState(ownerUserId) {
+    const key = this.getSessionKey(ownerUserId);
+    if (!this.sessions.has(key)) {
+      this.sessions.set(key, {
+        sock: null,
+        qrCode: null,
+        status: 'disconnected',
+        lastError: null,
+        reconnectAttempts: 0,
+        refreshInProgress: false,
+        manualDisconnect: false
+      });
+    }
+    return this.sessions.get(key);
   }
 
   sleep(ms) {
@@ -50,33 +76,55 @@ class WhatsAppService {
     return Math.min(maxDelay, Math.max(minDelay, Math.floor(estimated)));
   }
 
-  async sendTypingPresence(jid, text = '') {
-    if (!this.isTypingIndicatorEnabled() || !this.sock || this.status !== 'connected') {
+  async sendTypingPresence(ownerUserId, jid, text = '') {
+    const session = this.getSessionState(ownerUserId);
+    if (!this.isTypingIndicatorEnabled() || !session.sock || session.status !== 'connected') {
       return;
     }
 
     try {
-      await this.sock.sendPresenceUpdate('composing', jid);
+      await session.sock.sendPresenceUpdate('composing', jid);
       await this.sleep(this.getTypingDelayMs(text));
-      await this.sock.sendPresenceUpdate('paused', jid);
+      await session.sock.sendPresenceUpdate('paused', jid);
     } catch (error) {
       logger.warn(`Failed to send typing presence to ${jid}: ${error.message}`);
     }
   }
 
-  ensureAuthInfoDir() {
-    if (!fs.existsSync(this.authInfoPath)) {
-      fs.mkdirSync(this.authInfoPath, { recursive: true });
+  ensureBaseAuthInfoDir() {
+    if (!fs.existsSync(this.baseAuthInfoPath)) {
+      fs.mkdirSync(this.baseAuthInfoPath, { recursive: true });
     }
   }
 
-  resetInMemorySocketState() {
-    this.sock = null;
-    this.qrCode = null;
+  ensureAuthInfoDir(ownerUserId) {
+    const authInfoPath = this.getAuthInfoPath(ownerUserId);
+    if (!fs.existsSync(authInfoPath)) {
+      fs.mkdirSync(authInfoPath, { recursive: true });
+    }
   }
 
-  async updateSession(data) {
-    await WhatsAppSession.findOneAndUpdate({}, data, { upsert: true, new: true });
+  hasStoredCredentials(ownerUserId) {
+    return fs.existsSync(path.join(this.getAuthInfoPath(ownerUserId), 'creds.json'));
+  }
+
+  resetInMemorySocketState(ownerUserId) {
+    const session = this.getSessionState(ownerUserId);
+    session.sock = null;
+    session.qrCode = null;
+  }
+
+  async updateSession(ownerUserId, data) {
+    const normalizedOwnerUserId = this.normalizeOwnerUserId(ownerUserId);
+    const query = normalizedOwnerUserId
+      ? { owner_user_id: normalizedOwnerUserId }
+      : { owner_user_id: null };
+
+    await WhatsAppSession.findOneAndUpdate(
+      query,
+      { ...data, owner_user_id: normalizedOwnerUserId },
+      { upsert: true, new: true }
+    );
   }
 
   toFriendlyError(statusCode, errorMessage) {
@@ -109,38 +157,40 @@ class WhatsAppService {
     return adapt;
   }
 
-  async resetAuthState() {
+  async resetAuthState(ownerUserId) {
     try {
-      fs.rmSync(this.authInfoPath, { recursive: true, force: true });
-      fs.mkdirSync(this.authInfoPath, { recursive: true });
-      logger.warn('Auth state reset due to session/auth failure');
+      const authInfoPath = this.getAuthInfoPath(ownerUserId);
+      fs.rmSync(authInfoPath, { recursive: true, force: true });
+      fs.mkdirSync(authInfoPath, { recursive: true });
+      logger.warn(`Auth state reset due to session/auth failure (owner=${this.getSessionKey(ownerUserId)})`);
     } catch (error) {
       logger.error('Failed to reset auth state:', error);
     }
   }
 
-  async connect(options = {}) {
+  async connect(ownerUserId = null, options = {}) {
     const { forceReconnect = false } = options;
+    const session = this.getSessionState(ownerUserId);
 
-    if (!forceReconnect && ['connecting', 'qr_ready', 'connected'].includes(this.status)) {
-      logger.info(`WhatsApp connection request ignored because status is ${this.status}`);
+    if (!forceReconnect && ['connecting', 'qr_ready', 'connected'].includes(session.status)) {
+      logger.info(`WhatsApp connection request ignored because status is ${session.status} (owner=${this.getSessionKey(ownerUserId)})`);
       return;
     }
 
     try {
-      this.status = 'connecting';
-      this.qrCode = null;
-      this.lastError = null;
-      this.ensureAuthInfoDir();
+      session.status = 'connecting';
+      session.qrCode = null;
+      session.lastError = null;
+      this.ensureAuthInfoDir(ownerUserId);
 
-      await this.updateSession({ status: 'connecting', qr_code: null, last_error: null });
+      await this.updateSession(ownerUserId, { status: 'connecting', qr_code: null, last_error: null });
 
-      const { state, saveCreds } = await useMultiFileAuthState(this.authInfoPath);
+      const { state, saveCreds } = await useMultiFileAuthState(this.getAuthInfoPath(ownerUserId));
       const { version, isLatest } = await fetchLatestWaWebVersion({});
 
-      logger.info(`Using WA Web version ${version.join('.')} (isLatest=${isLatest})`);
+      logger.info(`Using WA Web version ${version.join('.')} (isLatest=${isLatest}, owner=${this.getSessionKey(ownerUserId)})`);
 
-      this.sock = makeWASocket({
+      session.sock = makeWASocket({
         auth: {
           creds: state.creds,
           keys: makeCacheableSignalKeyStore(state.keys, this.getBaileysKeyStoreLogger())
@@ -152,42 +202,46 @@ class WhatsAppService {
         markOnlineOnConnect: false
       });
 
-      this.sock.ev.on('connection.update', async (update) => {
-        await this.handleConnectionUpdate(update);
+      session.sock.ev.on('connection.update', async (update) => {
+        await this.handleConnectionUpdate(ownerUserId, update);
       });
 
-      this.sock.ev.on('creds.update', saveCreds);
+      session.sock.ev.on('creds.update', saveCreds);
 
-      this.sock.ev.on('messages.upsert', async ({ messages }) => {
-        await this.handleIncomingMessages(messages);
+      session.sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        await this.handleIncomingMessages(ownerUserId, messages, type);
       });
 
-      logger.info('WhatsApp service initialized');
+      logger.info(`WhatsApp service initialized (owner=${this.getSessionKey(ownerUserId)})`);
     } catch (error) {
-      logger.error('Error connecting to WhatsApp:', error);
+      logger.error(`Error connecting to WhatsApp (owner=${this.getSessionKey(ownerUserId)}):`, error);
+      session.status = 'disconnected';
+      session.lastError = error.message;
+      await this.updateSession(ownerUserId, { status: 'disconnected', qr_code: null, last_error: error.message });
       throw error;
     }
   }
 
-  async handleConnectionUpdate(update) {
+  async handleConnectionUpdate(ownerUserId, update) {
     const { connection, lastDisconnect, qr } = update;
+    const session = this.getSessionState(ownerUserId);
 
     if (qr) {
-      this.qrCode = await QRCode.toDataURL(qr);
-      this.status = 'qr_ready';
-      this.lastError = null;
+      session.qrCode = await QRCode.toDataURL(qr);
+      session.status = 'qr_ready';
+      session.lastError = null;
 
-      await this.updateSession({ status: 'qr_ready', qr_code: this.qrCode, last_error: null });
+      await this.updateSession(ownerUserId, { status: 'qr_ready', qr_code: session.qrCode, last_error: null });
 
-      logger.info('QR Code generated');
+      logger.info(`QR Code generated (owner=${this.getSessionKey(ownerUserId)})`);
     }
 
-    if (connection === 'connecting' && !qr && this.status === 'qr_ready') {
-      this.status = 'authorizing';
-      this.qrCode = null;
-      this.lastError = null;
-      await this.updateSession({ status: 'authorizing', qr_code: null, last_error: null });
-      logger.info('QR scanned. Waiting for WhatsApp login confirmation');
+    if (connection === 'connecting' && !qr && session.status === 'qr_ready') {
+      session.status = 'authorizing';
+      session.qrCode = null;
+      session.lastError = null;
+      await this.updateSession(ownerUserId, { status: 'authorizing', qr_code: null, last_error: null });
+      logger.info(`QR scanned. Waiting for WhatsApp login confirmation (owner=${this.getSessionKey(ownerUserId)})`);
     }
 
     if (connection === 'close') {
@@ -195,73 +249,85 @@ class WhatsAppService {
       const errorMessage = lastDisconnect?.error?.message || 'Unknown error';
       const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
 
-      logger.warn(`Connection closed. statusCode=${statusCode || 'unknown'} message=${errorMessage} manualDisconnect=${this.manualDisconnect} refreshInProgress=${this.refreshInProgress}`);
-      this.resetInMemorySocketState();
+      logger.warn(`Connection closed. statusCode=${statusCode || 'unknown'} message=${errorMessage} manualDisconnect=${session.manualDisconnect} refreshInProgress=${session.refreshInProgress} owner=${this.getSessionKey(ownerUserId)}`);
+      this.resetInMemorySocketState(ownerUserId);
 
-      if (this.manualDisconnect) {
-        this.manualDisconnect = false;
-        this.status = 'disconnected';
-        this.lastError = null;
-        this.reconnectAttempts = 0;
-        this.refreshInProgress = false;
+      if (session.manualDisconnect) {
+        session.manualDisconnect = false;
+        session.status = 'disconnected';
+        session.lastError = null;
+        session.reconnectAttempts = 0;
+        session.refreshInProgress = false;
 
-        await this.updateSession({ status: 'disconnected', qr_code: null, phone_number: null, last_error: null });
+        await this.updateSession(ownerUserId, { status: 'disconnected', qr_code: null, phone_number: null, last_error: null });
         return;
       }
 
-      if (this.refreshInProgress) {
-        this.refreshInProgress = false;
-        this.reconnectAttempts = 0;
-        this.status = 'connecting';
-        this.lastError = null;
+      if (session.refreshInProgress) {
+        session.refreshInProgress = false;
+        session.reconnectAttempts = 0;
+        session.status = 'connecting';
+        session.lastError = null;
 
-        await this.updateSession({ status: 'connecting', qr_code: null, last_error: null });
+        await this.updateSession(ownerUserId, { status: 'connecting', qr_code: null, last_error: null });
 
         setTimeout(() => {
-          void this.connect({ forceReconnect: true });
+          void this.connect(ownerUserId, { forceReconnect: true });
         }, 500);
         return;
       }
 
       if (isLoggedOut) {
-        await this.resetAuthState();
+        await this.resetAuthState(ownerUserId);
       }
 
-      const shouldReconnect = !this.manualDisconnect && this.reconnectAttempts < this.maxReconnectAttempts;
-      this.lastError = this.toFriendlyError(statusCode, errorMessage);
+      const shouldReconnect = !session.manualDisconnect && session.reconnectAttempts < this.maxReconnectAttempts;
+      session.lastError = this.toFriendlyError(statusCode, errorMessage);
 
       if (shouldReconnect) {
-        this.reconnectAttempts++;
-        this.status = 'connecting';
+        session.reconnectAttempts++;
+        session.status = 'connecting';
 
-        await this.updateSession({ status: 'connecting', qr_code: null, last_error: this.lastError });
+        await this.updateSession(ownerUserId, { status: 'connecting', qr_code: null, last_error: session.lastError });
 
         setTimeout(() => {
-          void this.connect({ forceReconnect: true });
+          void this.connect(ownerUserId, { forceReconnect: true });
         }, 3000);
       } else {
-        this.status = 'disconnected';
-        this.reconnectAttempts = 0;
+        session.status = 'disconnected';
+        session.reconnectAttempts = 0;
 
-        await this.updateSession({ status: 'disconnected', qr_code: null, phone_number: null, last_error: this.lastError });
+        await this.updateSession(ownerUserId, {
+          status: 'disconnected',
+          qr_code: null,
+          phone_number: null,
+          last_error: session.lastError
+        });
       }
     }
 
     if (connection === 'open') {
-      this.status = 'connected';
-      this.reconnectAttempts = 0;
-      this.qrCode = null;
-      this.lastError = null;
+      session.status = 'connected';
+      session.reconnectAttempts = 0;
+      session.qrCode = null;
+      session.lastError = null;
 
-      const phoneNumber = this.sock.user?.id?.split(':')[0] || 'Unknown';
+      const phoneNumber = session.sock?.user?.id?.split(':')[0] || 'Unknown';
 
-      await this.updateSession({ status: 'connected', qr_code: null, phone_number: phoneNumber, last_error: null });
+      await this.updateSession(ownerUserId, { status: 'connected', qr_code: null, phone_number: phoneNumber, last_error: null });
 
-      logger.info('WhatsApp connected successfully');
+      logger.info(`WhatsApp connected successfully (owner=${this.getSessionKey(ownerUserId)})`);
     }
   }
 
-  async handleIncomingMessages(messages) {
+  async handleIncomingMessages(ownerUserId, messages, upsertType = 'notify') {
+    const session = this.getSessionState(ownerUserId);
+
+    if (upsertType && upsertType !== 'notify') {
+      logger.info(`Skipping WhatsApp message upsert type=${upsertType} (owner=${this.getSessionKey(ownerUserId)})`);
+      return;
+    }
+
     for (const message of messages) {
       if (message.key.fromMe || !message.message) continue;
 
@@ -273,38 +339,45 @@ class WhatsAppService {
       const payload = this.unwrapMessagePayload(message.message);
       const protocolMessage = payload?.protocolMessage;
       const replyJid = this.resolveReplyJid(message);
+      const incomingTimestamp = this.toTimestampSeconds(message?.messageTimestamp);
+
+      if (sender.endsWith('@lid') && replyJid === sender) {
+        logger.warn(`Skipping LID inbound without phone mapping. Waiting for phone-mapped event (remoteJid=${sender}, wa_message_id=${message?.key?.id || 'none'}, owner=${this.getSessionKey(ownerUserId)})`);
+        continue;
+      }
+
       const customerPhone = this.resolveCustomerPhone(message);
       const lidPhone = sender.endsWith('@lid') ? this.normalizePhone(sender) : null;
-      const incomingTimestamp = this.toTimestampSeconds(message?.messageTimestamp);
 
       if (this.isRevokeProtocolMessage(protocolMessage)) {
         const revokedWaMessageId = protocolMessage?.key?.id;
         if (revokedWaMessageId) {
-          const revoked = await messageService.markMessageRevokedByWa(customerPhone, revokedWaMessageId, 'customer');
+          const revoked = await messageService.markMessageRevokedByWa(customerPhone, revokedWaMessageId, 'customer', ownerUserId);
           if (revoked) {
-            logger.info(`Message revoked by customer (phone=${customerPhone}, wa_message_id=${revokedWaMessageId})`);
+            logger.info(`Message revoked by customer (phone=${customerPhone}, wa_message_id=${revokedWaMessageId}, owner=${this.getSessionKey(ownerUserId)})`);
           } else {
-            logger.warn(`Revoke event received but target not found (phone=${customerPhone}, wa_message_id=${revokedWaMessageId})`);
+            logger.warn(`Revoke event received but target not found (phone=${customerPhone}, wa_message_id=${revokedWaMessageId}, owner=${this.getSessionKey(ownerUserId)})`);
           }
         }
         continue;
       }
 
-      const processableMessage = await this.extractProcessableMessageText(message, payload);
+      const processableMessage = await this.extractProcessableMessageText(message, payload, session.sock);
       const messageText = processableMessage.text;
       const quotedWaMessageId = this.extractQuotedWaMessageId(payload);
 
       if (messageText) {
-        logger.info(`Message received from ${sender} (customerPhone=${customerPhone}, replyJid=${replyJid}): ${messageText}`);
+        logger.info(`Message received from ${sender} (customerPhone=${customerPhone}, replyJid=${replyJid}, owner=${this.getSessionKey(ownerUserId)}): ${messageText}`);
 
         if (lidPhone && customerPhone && customerPhone !== lidPhone) {
-          const updated = await messageService.backfillPhoneAlias(lidPhone, customerPhone);
+          const updated = await messageService.backfillPhoneAlias(lidPhone, customerPhone, ownerUserId);
           if (updated > 0) {
-            logger.info(`Backfilled ${updated} old message(s) from ${lidPhone} to ${customerPhone}`);
+            logger.info(`Backfilled ${updated} old message(s) from ${lidPhone} to ${customerPhone} (owner=${this.getSessionKey(ownerUserId)})`);
           }
         }
 
-        await messageService.processMessage(customerPhone, messageText, this.sock, replyJid, {
+        await messageService.processMessage(customerPhone, messageText, session.sock, replyJid, {
+          ownerUserId,
           incomingKey: message.key,
           incomingRemoteJid: sender,
           incomingMessageTimestamp: incomingTimestamp,
@@ -312,7 +385,7 @@ class WhatsAppService {
           imageKnowledgeText: processableMessage.imageText || null
         });
       } else {
-        logger.info(`Message received from ${sender} but no supported text payload was found`);
+        logger.info(`Message received from ${sender} but no supported text payload was found (owner=${this.getSessionKey(ownerUserId)})`);
       }
     }
   }
@@ -437,9 +510,9 @@ class WhatsAppService {
     ).toString().trim();
   }
 
-  async extractProcessableMessageText(message, payload) {
+  async extractProcessableMessageText(message, payload, socket = null) {
     const text = this.extractMessageText(payload);
-    const imageText = await this.extractImageText(message, payload);
+    const imageText = await this.extractImageText(message, payload, socket);
 
     if (text && imageText) {
       return {
@@ -468,7 +541,7 @@ class WhatsAppService {
     return { text, imageText: '' };
   }
 
-  async extractImageText(message, payload) {
+  async extractImageText(message, payload, socket = null) {
     if (!payload?.imageMessage) {
       return '';
     }
@@ -483,7 +556,7 @@ class WhatsAppService {
         {},
         {
           logger: this.getBaileysKeyStoreLogger(),
-          reuploadRequest: this.sock?.updateMediaMessage
+          reuploadRequest: socket?.updateMediaMessage
         }
       );
 
@@ -520,14 +593,15 @@ class WhatsAppService {
     return protocolMessage.type === 0 || protocolMessage.type === 'REVOKE';
   }
 
-  async sendMessage(jid, text, options = undefined) {
-    if (!this.sock || this.status !== 'connected') {
+  async sendMessage(ownerUserId, jid, text, options = undefined) {
+    const session = this.getSessionState(ownerUserId);
+    if (!session.sock || session.status !== 'connected') {
       throw new Error('WhatsApp is not connected');
     }
 
     try {
-      await this.sendTypingPresence(jid, text);
-      const sent = await this.sock.sendMessage(jid, { text }, options);
+      await this.sendTypingPresence(ownerUserId, jid, text);
+      const sent = await session.sock.sendMessage(jid, { text }, options);
       logger.info(`Message sent to ${jid}: ${text}`);
       return sent;
     } catch (error) {
@@ -536,14 +610,15 @@ class WhatsAppService {
     }
   }
 
-  async sendImageMessage(jid, imageBuffer, caption = '', options = undefined) {
-    if (!this.sock || this.status !== 'connected') {
+  async sendImageMessage(ownerUserId, jid, imageBuffer, caption = '', options = undefined) {
+    const session = this.getSessionState(ownerUserId);
+    if (!session.sock || session.status !== 'connected') {
       throw new Error('WhatsApp is not connected');
     }
 
     try {
-      await this.sendTypingPresence(jid, caption || '[image]');
-      const sent = await this.sock.sendMessage(
+      await this.sendTypingPresence(ownerUserId, jid, caption || '[image]');
+      const sent = await session.sock.sendMessage(
         jid,
         {
           image: imageBuffer,
@@ -559,13 +634,14 @@ class WhatsAppService {
     }
   }
 
-  async deleteMessageForEveryone(jid, key) {
-    if (!this.sock || this.status !== 'connected') {
+  async deleteMessageForEveryone(ownerUserId, jid, key) {
+    const session = this.getSessionState(ownerUserId);
+    if (!session.sock || session.status !== 'connected') {
       throw new Error('WhatsApp is not connected');
     }
 
     try {
-      await this.sock.sendMessage(jid, { delete: key });
+      await session.sock.sendMessage(jid, { delete: key });
       logger.info(`Delete for everyone sent for message=${key?.id} jid=${jid}`);
       return true;
     } catch (error) {
@@ -574,13 +650,14 @@ class WhatsAppService {
     }
   }
 
-  async deleteMessageForMe(jid, key, messageTimestamp) {
-    if (!this.sock || this.status !== 'connected') {
+  async deleteMessageForMe(ownerUserId, jid, key, messageTimestamp) {
+    const session = this.getSessionState(ownerUserId);
+    if (!session.sock || session.status !== 'connected') {
       throw new Error('WhatsApp is not connected');
     }
 
     try {
-      await this.sock.chatModify(
+      await session.sock.chatModify(
         {
           delete: true,
           lastMessages: [{
@@ -598,13 +675,14 @@ class WhatsAppService {
     }
   }
 
-  async editMessage(jid, key, text) {
-    if (!this.sock || this.status !== 'connected') {
+  async editMessage(ownerUserId, jid, key, text) {
+    const session = this.getSessionState(ownerUserId);
+    if (!session.sock || session.status !== 'connected') {
       throw new Error('WhatsApp is not connected');
     }
 
     try {
-      const sent = await this.sock.sendMessage(jid, { text, edit: key });
+      const sent = await session.sock.sendMessage(jid, { text, edit: key });
       logger.info(`Edit message sent for message=${key?.id} jid=${jid}`);
       return sent;
     } catch (error) {
@@ -613,84 +691,121 @@ class WhatsAppService {
     }
   }
 
-  async disconnect() {
-    if (this.sock) {
-      this.manualDisconnect = true;
-      this.refreshInProgress = false;
-      await this.sock.logout();
-      this.resetInMemorySocketState();
-      this.status = 'disconnected';
-      this.lastError = null;
+  async disconnect(ownerUserId = null) {
+    const session = this.getSessionState(ownerUserId);
 
-      await this.updateSession({ status: 'disconnected', qr_code: null, phone_number: null, last_error: null });
-
-      logger.info('WhatsApp disconnected');
+    if (session.sock) {
+      session.manualDisconnect = true;
+      session.refreshInProgress = false;
+      await session.sock.logout();
+      this.resetInMemorySocketState(ownerUserId);
     }
+
+    session.status = 'disconnected';
+    session.lastError = null;
+
+    await this.updateSession(ownerUserId, { status: 'disconnected', qr_code: null, phone_number: null, last_error: null });
+
+    logger.info(`WhatsApp disconnected (owner=${this.getSessionKey(ownerUserId)})`);
   }
 
-  async refreshQRCode() {
-    if (this.status !== 'qr_ready') {
+  async refreshQRCode(ownerUserId = null) {
+    const session = this.getSessionState(ownerUserId);
+    if (session.status !== 'qr_ready') {
       throw new Error('QR refresh is only available while waiting for scan');
     }
 
-    this.refreshInProgress = true;
-    this.qrCode = null;
-    this.status = 'connecting';
-    this.lastError = null;
+    session.refreshInProgress = true;
+    session.qrCode = null;
+    session.status = 'connecting';
+    session.lastError = null;
 
-    await this.updateSession({ status: 'connecting', qr_code: null, last_error: null });
+    await this.updateSession(ownerUserId, { status: 'connecting', qr_code: null, last_error: null });
 
-    if (this.sock) {
-      this.sock.end(new Error('QR refresh requested'));
+    if (session.sock) {
+      session.sock.end(new Error('QR refresh requested'));
     } else {
-      this.refreshInProgress = false;
-      await this.connect({ forceReconnect: true });
+      session.refreshInProgress = false;
+      await this.connect(ownerUserId, { forceReconnect: true });
     }
 
-    logger.info('QR refresh requested');
+    logger.info(`QR refresh requested (owner=${this.getSessionKey(ownerUserId)})`);
   }
 
-  async restartPairing() {
-    this.refreshInProgress = false;
-    this.manualDisconnect = false;
-    this.qrCode = null;
-    this.status = 'connecting';
-    this.lastError = null;
+  async restartPairing(ownerUserId = null) {
+    const session = this.getSessionState(ownerUserId);
 
-    await this.updateSession({
+    session.refreshInProgress = false;
+    session.manualDisconnect = false;
+    session.qrCode = null;
+    session.status = 'connecting';
+    session.lastError = null;
+
+    await this.updateSession(ownerUserId, {
       status: 'connecting',
       qr_code: null,
       phone_number: null,
       last_error: null
     });
 
-    if (this.sock) {
+    if (session.sock) {
       try {
-        this.sock.end(new Error('Pairing restart requested'));
+        session.sock.end(new Error('Pairing restart requested'));
       } catch (error) {
         logger.warn(`Failed to close old socket on pairing restart: ${error.message}`);
       }
-      this.resetInMemorySocketState();
+      this.resetInMemorySocketState(ownerUserId);
     }
 
-    await this.connect({ forceReconnect: true });
-    logger.info('Pairing restart requested');
+    await this.connect(ownerUserId, { forceReconnect: true });
+    logger.info(`Pairing restart requested (owner=${this.getSessionKey(ownerUserId)})`);
   }
 
-  getStatus() {
+  getStatus(ownerUserId = null) {
+    const session = this.getSessionState(ownerUserId);
     return {
-      status: this.status,
-      qrCode: this.qrCode,
-      lastError: this.lastError
+      status: session.status,
+      qrCode: session.qrCode,
+      lastError: session.lastError
     };
   }
 
-  getQRCode() {
-    return this.qrCode;
+  getQRCode(ownerUserId = null) {
+    return this.getSessionState(ownerUserId).qrCode;
   }
 
-  isConnected() {
-    return this.status === 'connected';
+  isConnected(ownerUserId = null) {
+    return this.getSessionState(ownerUserId).status === 'connected';
+  }
+
+  getConnectedCount() {
+    return Array.from(this.sessions.values()).filter((session) => session.status === 'connected').length;
+  }
+
+  async connectStoredSessions() {
+    this.ensureBaseAuthInfoDir();
+
+    const storedSessions = await WhatsAppSession.find({
+      owner_user_id: { $ne: null },
+      status: { $in: ['connected', 'connecting', 'qr_ready', 'authorizing'] }
+    }).lean();
+
+    let attempted = 0;
+    for (const storedSession of storedSessions) {
+      const ownerUserId = storedSession.owner_user_id;
+      if (!this.hasStoredCredentials(ownerUserId)) {
+        continue;
+      }
+
+      attempted++;
+      try {
+        await this.connect(ownerUserId, { forceReconnect: true });
+      } catch (error) {
+        logger.warn(`Failed to auto-connect WhatsApp session for owner=${ownerUserId}: ${error.message}`);
+      }
+    }
+
+    return attempted;
   }
 }
 

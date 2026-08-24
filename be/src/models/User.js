@@ -13,10 +13,23 @@ const userSchema = new mongoose.Schema({
     type: String,
     required: true,
     minlength: 6
+  },
+  nama_sales: {
+    type: String,
+    default: '-',
+    trim: true,
+    uppercase: true
+  },
+  kode_sales: {
+    type: String,
+    trim: true,
+    uppercase: true
   }
 }, {
   timestamps: true
 });
+
+userSchema.index({ kode_sales: 1 }, { unique: true, sparse: true });
 
 userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) return next();
@@ -30,4 +43,4 @@ userSchema.methods.comparePassword = async function(candidatePassword) {
   return await bcrypt.compare(candidatePassword, this.password);
 };
 
-module.exports = mongoose.model('User', userSchema);
+module.exports = mongoose.model('User', userSchema, 'tm_user');

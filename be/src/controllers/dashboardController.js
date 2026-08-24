@@ -1,10 +1,11 @@
 const Message = require('../models/Message');
 const Rule = require('../models/Rule');
+const KnowledgeDocument = require('../models/KnowledgeDocument');
 const logger = require('../utils/logger');
 
 exports.getStats = async (req, res) => {
   try {
-    const [totalMessages, totalAutoReplies, totalRules, activeRules] = await Promise.all([
+    const [totalMessages, totalAutoReplies, totalRules, activeRules, totalKnowledge, indexedKnowledge] = await Promise.all([
       Message.countDocuments(),
       Message.countDocuments({
         $or: [
@@ -21,6 +22,8 @@ exports.getStats = async (req, res) => {
       }),
       Rule.countDocuments(),
       Rule.countDocuments({ is_active: true }),
+      KnowledgeDocument.countDocuments(),
+      KnowledgeDocument.countDocuments({ status: 'indexed', status_active: { $ne: true } }),
     ]);
 
     res.json({
@@ -30,6 +33,8 @@ exports.getStats = async (req, res) => {
         totalAutoReplies,
         totalRules,
         activeRules,
+        totalKnowledge,
+        indexedKnowledge,
       },
     });
   } catch (error) {

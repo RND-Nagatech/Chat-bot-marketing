@@ -3,6 +3,19 @@ const messageService = require('../services/messageService');
 const whatsappService = require('../services/whatsappService');
 const logger = require('../utils/logger');
 
+const getOwnerUserId = (req) => {
+  const salesId = req.user?.kode_sales || req.user?.salesId || req.user?.userId;
+  return salesId ? String(salesId) : null;
+};
+
+const getActorName = (req) => (
+  req.user?.nama_sales ||
+  req.user?.kode_sales ||
+  req.user?.email ||
+  req.user?.userId ||
+  'admin'
+);
+
 const imageUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -31,11 +44,12 @@ exports.imageUploadMiddleware = (req, res, next) => {
 
 exports.getAllMessages = async (req, res) => {
   try {
+    const ownerUserId = getOwnerUserId(req);
     const limit = parseInt(req.query.limit) || 100;
     const skip = parseInt(req.query.skip) || 0;
 
-    const messages = await messageService.getAllMessages(limit, skip);
-    const totalCount = await messageService.getMessagesCount();
+    const messages = await messageService.getAllMessages(limit, skip, ownerUserId);
+    const totalCount = await messageService.getMessagesCount(ownerUserId);
 
     res.json({
       success: true,
@@ -54,10 +68,11 @@ exports.getAllMessages = async (req, res) => {
 
 exports.getMessagesByPhone = async (req, res) => {
   try {
+    const ownerUserId = getOwnerUserId(req);
     const { phone } = req.params;
     const limit = parseInt(req.query.limit) || 50;
 
-    const messages = await messageService.getMessagesByPhone(phone, limit);
+    const messages = await messageService.getMessagesByPhone(phone, limit, ownerUserId);
 
     res.json({
       success: true,
@@ -75,12 +90,18 @@ exports.getMessagesByPhone = async (req, res) => {
 
 exports.getConversations = async (req, res) => {
   try {
-    const conversations = await messageService.getConversations();
+    const ownerUserId = getOwnerUserId(req);
+    const conversations = await messageService.getConversations(ownerUserId, {
+      search: req.query.search,
+      page: req.query.page,
+      limit: req.query.limit
+    });
 
     res.json({
       success: true,
-      count: conversations.length,
-      data: conversations
+      count: conversations.data.length,
+      data: conversations.data,
+      meta: conversations.meta
     });
   } catch (error) {
     logger.error('Error fetching conversations:', error);
@@ -93,9 +114,10 @@ exports.getConversations = async (req, res) => {
 
 exports.getConversationByPhone = async (req, res) => {
   try {
+    const ownerUserId = getOwnerUserId(req);
     const { phone } = req.params;
     const limit = parseInt(req.query.limit, 10) || undefined;
-    const messages = await messageService.getConversationByPhone(phone, limit);
+    const messages = await messageService.getConversationByPhone(phone, limit, ownerUserId);
 
     res.json({
       success: true,
@@ -129,16 +151,18 @@ exports.sendManualReply = async (req, res) => {
       });
     }
 
-    if (!whatsappService.isConnected()) {
+    const ownerUserId = getOwnerUserId(req);
+    if (!whatsappService.isConnected(ownerUserId)) {
       return res.status(400).json({
         success: false,
         message: 'WhatsApp belum terhubung. Silakan hubungkan terlebih dahulu.'
       });
     }
 
-    const resolvedBy = req.user?.email || req.user?.userId || 'admin';
+    const resolvedBy = getActorName(req);
 
     const message = await messageService.sendManualReply(phone.trim(), text, whatsappService, {
+      ownerUserId,
       replyToMessageId,
       resolvedBy
     });
@@ -183,20 +207,22 @@ exports.sendManualImageReply = async (req, res) => {
       });
     }
 
-    if (!whatsappService.isConnected()) {
+    const ownerUserId = getOwnerUserId(req);
+    if (!whatsappService.isConnected(ownerUserId)) {
       return res.status(400).json({
         success: false,
         message: 'WhatsApp belum terhubung. Silakan hubungkan terlebih dahulu.'
       });
     }
 
-    const resolvedBy = req.user?.email || req.user?.userId || 'admin';
+    const resolvedBy = getActorName(req);
     const message = await messageService.sendManualImageReply(
       phone.trim(),
       req.file.buffer,
       caption,
       whatsappService,
       {
+        ownerUserId,
         replyToMessageId,
         resolvedBy
       }
@@ -234,8 +260,9 @@ exports.resolvePendingMessage = async (req, res) => {
       return res.status(400).json({ success: false, message: 'message_id wajib diisi' });
     }
 
-    const resolvedBy = req.user?.email || req.user?.userId || 'admin';
-    const message = await messageService.resolvePendingMessage(phone.trim(), messageId, resolvedBy);
+    const resolvedBy = getActorName(req);
+    const ownerUserId = getOwnerUserId(req);
+    const message = await messageService.resolvePendingMessage(phone.trim(), messageId, resolvedBy, ownerUserId);
 
     res.json({
       success: true,
@@ -245,6 +272,36 @@ exports.resolvePendingMessage = async (req, res) => {
   } catch (error) {
     logger.error('Error resolving pending message:', error);
     if (/tidak valid|tidak ditemukan|terselesaikan/i.test(error.message || '')) {
+      return res.status(400).json({ success: false, message: error.message });
+    }
+    res.status(500).json({ success: false, message: 'Gagal menyelesaikan status pending' });
+  }
+};
+
+exports.resolvePendingMessages = async (req, res) => {
+  try {
+    const { phone, message_ids: messageIds = [] } = req.body || {};
+    if (!phone || typeof phone !== 'string') {
+      return res.status(400).json({ success: false, message: 'Nomor telepon wajib diisi' });
+    }
+    if (!Array.isArray(messageIds)) {
+      return res.status(400).json({ success: false, message: 'message_ids harus berupa array' });
+    }
+
+    const resolvedBy = getActorName(req);
+    const ownerUserId = getOwnerUserId(req);
+    const result = await messageService.resolvePendingMessages(phone.trim(), messageIds, resolvedBy, ownerUserId);
+
+    res.json({
+      success: true,
+      message: messageIds.length > 0
+        ? 'Status pending terpilih berhasil diselesaikan'
+        : 'Semua status pending berhasil diselesaikan',
+      data: result
+    });
+  } catch (error) {
+    logger.error('Error resolving pending messages:', error);
+    if (/tidak valid|wajib|harus berupa array/i.test(error.message || '')) {
       return res.status(400).json({ success: false, message: error.message });
     }
     res.status(500).json({ success: false, message: 'Gagal menyelesaikan status pending' });
@@ -261,8 +318,9 @@ exports.deleteMessageForMe = async (req, res) => {
       return res.status(400).json({ success: false, message: 'message_id wajib diisi' });
     }
 
-    const deletedBy = req.user?.email || req.user?.userId || 'admin';
-    await messageService.deleteMessageForMe(phone.trim(), messageId, deletedBy, whatsappService);
+    const deletedBy = getActorName(req);
+    const ownerUserId = getOwnerUserId(req);
+    await messageService.deleteMessageForMe(phone.trim(), messageId, deletedBy, whatsappService, ownerUserId);
 
     res.json({
       success: true,
@@ -287,8 +345,9 @@ exports.deleteMessageForAll = async (req, res) => {
       return res.status(400).json({ success: false, message: 'message_id wajib diisi' });
     }
 
-    const deletedBy = req.user?.email || req.user?.userId || 'admin';
-    await messageService.deleteMessageForAll(phone.trim(), messageId, deletedBy, whatsappService);
+    const deletedBy = getActorName(req);
+    const ownerUserId = getOwnerUserId(req);
+    await messageService.deleteMessageForAll(phone.trim(), messageId, deletedBy, whatsappService, ownerUserId);
 
     res.json({
       success: true,
@@ -315,15 +374,16 @@ exports.editMessage = async (req, res) => {
     if (!text || typeof text !== 'string' || !text.trim()) {
       return res.status(400).json({ success: false, message: 'Pesan edit tidak boleh kosong' });
     }
-    if (!whatsappService.isConnected()) {
+    const ownerUserId = getOwnerUserId(req);
+    if (!whatsappService.isConnected(ownerUserId)) {
       return res.status(400).json({
         success: false,
         message: 'WhatsApp belum terhubung. Silakan hubungkan terlebih dahulu.'
       });
     }
 
-    const editedBy = req.user?.email || req.user?.userId || 'admin';
-    const message = await messageService.editMessage(phone.trim(), messageId, text, editedBy, whatsappService);
+    const editedBy = getActorName(req);
+    const message = await messageService.editMessage(phone.trim(), messageId, text, editedBy, whatsappService, ownerUserId);
 
     res.json({
       success: true,

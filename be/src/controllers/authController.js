@@ -2,6 +2,19 @@ const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const logger = require('../utils/logger');
 
+const mapAuthUser = (user) => {
+  const kodeSales = user.kode_sales || user._id.toString();
+  const namaSales = user.nama_sales && user.nama_sales !== '-' ? user.nama_sales : user.email;
+
+  return {
+    id: kodeSales,
+    user_id: user._id,
+    email: user.email,
+    nama_sales: namaSales,
+    kode_sales: kodeSales
+  };
+};
+
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -31,8 +44,15 @@ exports.login = async (req, res) => {
       });
     }
 
+    const authUser = mapAuthUser(user);
     const token = jwt.sign(
-      { userId: user._id, email: user.email },
+      {
+        userId: user._id,
+        email: user.email,
+        nama_sales: authUser.nama_sales,
+        kode_sales: authUser.kode_sales,
+        salesId: authUser.kode_sales
+      },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
@@ -42,10 +62,7 @@ exports.login = async (req, res) => {
     res.json({
       success: true,
       token,
-      user: {
-        id: user._id,
-        email: user.email
-      }
+      user: authUser
     });
   } catch (error) {
     logger.error('Login error:', error);
@@ -58,7 +75,7 @@ exports.login = async (req, res) => {
 
 exports.register = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, nama_sales: namaSales, kode_sales: kodeSales } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({
@@ -83,11 +100,23 @@ exports.register = async (req, res) => {
       });
     }
 
-    const user = new User({ email, password });
+    const user = new User({
+      email,
+      password,
+      nama_sales: (namaSales || email).toString().trim(),
+      kode_sales: kodeSales ? kodeSales.toString().trim() : undefined
+    });
     await user.save();
 
+    const authUser = mapAuthUser(user);
     const token = jwt.sign(
-      { userId: user._id, email: user.email },
+      {
+        userId: user._id,
+        email: user.email,
+        nama_sales: authUser.nama_sales,
+        kode_sales: authUser.kode_sales,
+        salesId: authUser.kode_sales
+      },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
@@ -97,10 +126,7 @@ exports.register = async (req, res) => {
     res.status(201).json({
       success: true,
       token,
-      user: {
-        id: user._id,
-        email: user.email
-      }
+      user: authUser
     });
   } catch (error) {
     logger.error('Registration error:', error);
