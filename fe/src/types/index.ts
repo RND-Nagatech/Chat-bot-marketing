@@ -26,6 +26,13 @@ export interface ConversationSummary {
   last_status: "handled_by_bot" | "needs_admin_follow_up";
 }
 
+export interface PaginationMeta {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+}
+
 export interface ChatMessage {
   id: string;
   source_message_id?: string;
@@ -36,6 +43,10 @@ export interface ChatMessage {
   delivery_status: "sent" | "failed" | null;
   status: "handled_by_bot" | "needs_admin_follow_up";
   follow_up_state?: "open" | "resolved" | null;
+  follow_up_category?: string | null;
+  follow_up_reason?: string | null;
+  follow_up_summary?: string | null;
+  ai_trace_run_id?: string | null;
   reply_to_message_id?: string | null;
   reply_to_wa_message_id?: string | null;
   wa_message_id?: string | null;
@@ -60,6 +71,8 @@ export interface DashboardStats {
   totalAutoReplies: number;
   totalRules: number;
   activeRules: number;
+  totalKnowledge?: number;
+  indexedKnowledge?: number;
 }
 
 export interface KnowledgeDocument {
@@ -119,8 +132,89 @@ export interface KnowledgeStatus {
   };
 }
 
+export interface AiTraceEvent {
+  sequence: number;
+  type: string;
+  data: unknown;
+  timestamp: string;
+}
+
+export interface AiTraceRun {
+  _id?: string;
+  run_id: string;
+  phone?: string | null;
+  message_id?: string | null;
+  wa_message_id?: string | null;
+  user_message: string;
+  answer?: string | null;
+  source?: string | null;
+  confidence?: number;
+  follow_up?: {
+    needed: boolean;
+    category?: string | null;
+    reason?: string | null;
+    summary?: string | null;
+  };
+  status: "running" | "completed" | "failed";
+  error?: string | null;
+  events?: AiTraceEvent[];
+  started_at: string;
+  completed_at?: string | null;
+}
+
+export interface CustomerOrder {
+  id: string;
+  sales_id?: string | null;
+  sales_name?: string | null;
+  phone: string;
+  nama: string;
+  nama_toko: string;
+  alamat: string;
+  no_hp: string;
+  orderan: string;
+  source_message_id?: string | null;
+  wa_message_id?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CustomerOrderMeta {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+  totalCustomers: number;
+  totalOrders: number;
+}
+
+export interface DemoRequest {
+  id: string;
+  sales_id?: string | null;
+  sales_name?: string | null;
+  phone: string;
+  nama: string;
+  nama_toko: string;
+  alamat: string;
+  no_hp: string;
+  demo_program: string;
+  source_message_id?: string | null;
+  wa_message_id?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DemoRequestMeta {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+  totalDemoRequests: number;
+}
+
 export interface User {
   id: string;
   email: string;
+  nama_sales?: string;
+  kode_sales?: string;
   token: string;
 }

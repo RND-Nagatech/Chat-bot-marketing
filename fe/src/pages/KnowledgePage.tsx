@@ -27,6 +27,7 @@ import {
   updateRule,
   uploadKnowledgeDocument,
 } from "@/services/api";
+import { Pagination } from "@/components/Pagination";
 import { RuleFormModal } from "@/components/RuleFormModal";
 import type { KnowledgeDocument, KnowledgeStatus, Rule } from "@/types";
 import { toast } from "sonner";
@@ -239,6 +240,8 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
   const [deleteTarget, setDeleteTarget] = useState<KnowledgeDocument | null>(null);
   const [textTitle, setTextTitle] = useState("");
   const [textBody, setTextBody] = useState("");
+  const [page, setPage] = useState(1);
+  const [limit, setLimit] = useState(10);
 
   const load = useCallback((options?: { silent?: boolean }) => {
     if (!options?.silent) {
@@ -282,14 +285,23 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
     () => documents.filter((document) => document.status_active !== true).length,
     [documents]
   );
+  const totalPages = useMemo(
+    () => Math.max(1, Math.ceil(documents.length / limit)),
+    [documents.length, limit]
+  );
+  const paginatedDocuments = useMemo(
+    () => documents.slice((page - 1) * limit, page * limit),
+    [documents, limit, page]
+  );
   const llmStatus = status?.llm || status?.lm_studio;
   const chatProviderLabel = llmStatus?.chat_provider === "deepseek" ? "DeepSeek" : "LM Studio";
   const chatConnected = llmStatus?.chat_connected ?? llmStatus?.connected;
-  const embeddingConnected = llmStatus?.embedding_connected ?? llmStatus?.connected;
-  const embeddingProviderLabel = llmStatus?.embedding_provider === "local_hash" ? "Lokal" : "Eksternal";
-  const vectorStore = status?.vector_store;
-  const vectorStoreLabel = vectorStore?.provider === "qdrant" ? "Qdrant" : "MongoDB";
-  const vectorStoreConnected = vectorStore?.connected ?? true;
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
 
   const handleUpload = async () => {
     if (!selectedFile) {
@@ -301,6 +313,7 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
     try {
       const document = await uploadKnowledgeDocument(selectedFile);
       setDocuments((prev) => [document, ...prev]);
+      setPage(1);
       setSelectedFile(null);
       toast.success(document.status === "indexed" ? "Dokumen berhasil diindex" : "Dokumen diterima, tetapi belum berhasil diindex");
     } catch {
@@ -352,6 +365,7 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
         if (editingDocument) {
           return prev.map((item) => (item._id === editingDocument._id ? document : item));
         }
+        setPage(1);
         return [document, ...prev];
       });
       resetTextForm();
@@ -424,16 +438,6 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
           <div className="mt-2 text-sm font-medium text-foreground">
             {chatConnected ? "Chat terhubung" : "Chat tidak terhubung"}
           </div>
-          <div className="mt-1 truncate text-xs text-muted-foreground">{llmStatus?.chat_base_url || llmStatus?.base_url || "Memuat..."}</div>
-          <div className={`mt-2 text-xs font-medium ${embeddingConnected ? "text-primary" : "text-destructive"}`}>
-            Embedding {embeddingProviderLabel} {embeddingConnected ? "aktif" : "tidak aktif"}
-          </div>
-          <div className={`mt-1 text-xs font-medium ${vectorStoreConnected ? "text-primary" : "text-destructive"}`}>
-            Vector {vectorStoreLabel} {vectorStoreConnected ? "aktif" : "tidak aktif"}
-          </div>
-          {vectorStore?.collection && (
-            <div className="mt-1 truncate text-xs text-muted-foreground">{vectorStore.collection}</div>
-          )}
         </div>
       </div>
 
@@ -448,7 +452,8 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
               type="file"
               accept=".txt,.md,.pdf,.jpg,.jpeg,.png,.webp,text/plain,text/markdown,application/pdf,image/jpeg,image/png,image/webp"
               onChange={(event) => setSelectedFile(event.target.files?.[0] || null)}
-              className="w-full rounded-lg border bg-background px-3 py-2 text-sm text-foreground file:mr-3 file:rounded-md file:border-0 file:bg-muted file:px-3 file:py-1.5 file:text-sm file:text-foreground"
+              disabled={uploading}
+              className="w-full cursor-pointer rounded-lg border bg-background px-3 py-2 text-sm text-foreground file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-muted file:px-3 file:py-1.5 file:text-sm file:text-foreground disabled:cursor-not-allowed disabled:opacity-60 disabled:file:cursor-not-allowed"
             />
             <button
               onClick={handleUpload}
@@ -538,7 +543,7 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
           ) : documents.length === 0 ? (
             <div className="px-4 py-10 text-center text-sm text-muted-foreground">Belum ada dokumen knowledge</div>
           ) : (
-            documents.map((document) => (
+            paginatedDocuments.map((document) => (
               <div
                 key={document._id}
                 className={`flex flex-col gap-3 px-4 py-4 lg:flex-row lg:items-center lg:justify-between ${
@@ -617,6 +622,19 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
             ))
           )}
         </div>
+        {documents.length > 0 && (
+          <Pagination
+            page={page}
+            totalPages={totalPages}
+            pageSize={limit}
+            disabled={loading}
+            onPageChange={setPage}
+            onPageSizeChange={(nextLimit) => {
+              setLimit(nextLimit);
+              setPage(1);
+            }}
+          />
+        )}
       </div>
 
       {deleteTarget && (
@@ -660,7 +678,6 @@ function DocumentsTab({ autoRefreshMs }: { autoRefreshMs: number }) {
 }
 
 export default function KnowledgePage() {
-  const [activeTab, setActiveTab] = useState<"answers" | "documents">("answers");
   const [autoRefreshMs, setAutoRefreshMs] = useState<number>(() => {
     const raw = localStorage.getItem("knowledge_auto_refresh_ms");
     const parsed = Number(raw);
@@ -677,7 +694,7 @@ export default function KnowledgePage() {
         <div>
           <h1 className="text-3xl font-extrabold tracking-tight text-foreground">Knowledge</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Kelola jawaban cepat dan dokumen marketing untuk auto-reply WhatsApp.
+            Kelola dokumen marketing untuk auto-reply WhatsApp berbasis DeepSeek dan Qdrant.
           </p>
         </div>
         <div className="flex items-center gap-2 self-start rounded-lg border bg-card px-3 py-2">
@@ -696,30 +713,7 @@ export default function KnowledgePage() {
         </div>
       </div>
 
-      <div className="inline-flex rounded-lg border bg-card/90 p-1 shadow-sm">
-        <button
-          onClick={() => setActiveTab("answers")}
-          className={`rounded-md px-4 py-2 text-sm font-medium transition-colors ${
-            activeTab === "answers" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted"
-          }`}
-        >
-          Jawaban Cepat
-        </button>
-        <button
-          onClick={() => setActiveTab("documents")}
-          className={`rounded-md px-4 py-2 text-sm font-medium transition-colors ${
-            activeTab === "documents" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted"
-          }`}
-        >
-          Dokumen
-        </button>
-      </div>
-
-      {activeTab === "answers" ? (
-        <QuickAnswersTab autoRefreshMs={autoRefreshMs} />
-      ) : (
-        <DocumentsTab autoRefreshMs={autoRefreshMs} />
-      )}
+      <DocumentsTab autoRefreshMs={autoRefreshMs} />
     </div>
   );
 }

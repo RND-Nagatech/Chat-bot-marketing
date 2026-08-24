@@ -8,7 +8,10 @@ import Index from "./pages/Index";
 import LoginPage from "./pages/LoginPage";
 import DashboardPage from "./pages/DashboardPage";
 import KnowledgePage from "./pages/KnowledgePage";
+import AiTracePage from "./pages/AiTracePage";
 import MessagesPage from "./pages/MessagesPage";
+import CustomersPage from "./pages/CustomersPage";
+import DemoRequestsPage from "./pages/DemoRequestsPage";
 import WhatsAppPage from "./pages/WhatsAppPage";
 import NotFound from "./pages/NotFound";
 
@@ -29,10 +32,13 @@ function AppRoutes() {
     <Routes>
       <Route path="/" element={<Index />} />
       <Route path="/login" element={user ? <Navigate to="/dashboard" replace /> : <LoginPage onLogin={saveUser} />} />
-      <Route element={user ? <DashboardLayout onLogout={logout} /> : <Navigate to="/login" replace />}>
+      <Route element={user ? <DashboardLayout onLogout={logout} user={user} /> : <Navigate to="/login" replace />}>
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/rules" element={<Navigate to="/knowledge" replace />} />
         <Route path="/knowledge" element={<KnowledgePage />} />
+        <Route path="/ai-trace" element={<AiTracePage />} />
+        <Route path="/customers" element={<CustomersPage />} />
+        <Route path="/demo-requests" element={<DemoRequestsPage />} />
         <Route path="/messages" element={<MessagesPage />} />
         <Route path="/whatsapp" element={<WhatsAppPage />} />
       </Route>

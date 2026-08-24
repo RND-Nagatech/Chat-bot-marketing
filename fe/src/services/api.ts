@@ -1,5 +1,5 @@
 import axios from "axios";
-import type { Rule, Message, WAStatus, DashboardStats, ConversationSummary, ChatMessage, KnowledgeDocument, KnowledgeStatus } from "@/types";
+import type { Rule, Message, WAStatus, DashboardStats, ConversationSummary, ChatMessage, KnowledgeDocument, KnowledgeStatus, AiTraceRun, CustomerOrder, CustomerOrderMeta, DemoRequest, DemoRequestMeta, PaginationMeta } from "@/types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:3000/api";
 
@@ -63,6 +63,10 @@ const mapChatMessage = (m: any): ChatMessage => ({
   delivery_status: m.delivery_status ?? null,
   status: m.status || "handled_by_bot",
   follow_up_state: m.follow_up_state ?? null,
+  follow_up_category: m.follow_up_category ?? null,
+  follow_up_reason: m.follow_up_reason ?? null,
+  follow_up_summary: m.follow_up_summary ?? null,
+  ai_trace_run_id: m.ai_trace_run_id ?? null,
   reply_to_message_id: m.reply_to_message_id ?? null,
   reply_to_wa_message_id: m.reply_to_wa_message_id ?? null,
   wa_message_id: m.wa_message_id ?? null,
@@ -75,10 +79,50 @@ const mapChatMessage = (m: any): ChatMessage => ({
   timestamp: m.timestamp || m.createdAt,
 });
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mapCustomerOrder = (c: any): CustomerOrder => ({
+  id: c._id || c.id,
+  sales_id: c.sales_id || null,
+  sales_name: c.sales_name || c.nama_sales || null,
+  phone: c.phone,
+  nama: c.nama || "-",
+  nama_toko: c.nama_toko || "-",
+  alamat: c.alamat || "-",
+  no_hp: c.no_hp || "-",
+  orderan: c.orderan || "-",
+  source_message_id: c.source_message_id || null,
+  wa_message_id: c.wa_message_id || null,
+  createdAt: c.createdAt,
+  updatedAt: c.updatedAt,
+});
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const mapDemoRequest = (c: any): DemoRequest => ({
+  id: c._id || c.id,
+  sales_id: c.sales_id || null,
+  sales_name: c.sales_name || c.nama_sales || null,
+  phone: c.phone,
+  nama: c.nama || "-",
+  nama_toko: c.nama_toko || "-",
+  alamat: c.alamat || "-",
+  no_hp: c.no_hp || "-",
+  demo_program: c.demo_program || "-",
+  source_message_id: c.source_message_id || null,
+  wa_message_id: c.wa_message_id || null,
+  createdAt: c.createdAt,
+  updatedAt: c.updatedAt,
+});
+
 // Auth
 export const login = async (email: string, password: string) => {
   const { data } = await api.post("/auth/login", { email, password });
-  return { id: data.user.id, email: data.user.email, token: data.token };
+  return {
+    id: data.user.kode_sales || data.user.id,
+    email: data.user.email,
+    nama_sales: data.user.nama_sales,
+    kode_sales: data.user.kode_sales || data.user.id,
+    token: data.token,
+  };
 };
 
 // Rules
@@ -152,9 +196,20 @@ export const getMessages = async (): Promise<Message[]> => {
   return data.data.map(mapMessage);
 };
 
-export const getConversations = async (): Promise<ConversationSummary[]> => {
-  const { data } = await api.get("/messages/conversations");
-  return data.data.map(mapConversation);
+export const getConversations = async (
+  params: { search?: string; page?: number; limit?: number } = {}
+): Promise<{ data: ConversationSummary[]; meta: PaginationMeta }> => {
+  const { data } = await api.get("/messages/conversations", { params });
+  const rows = data.data.map(mapConversation);
+  return {
+    data: rows,
+    meta: data.meta || {
+      page: params.page || 1,
+      limit: params.limit || rows.length || 10,
+      total: rows.length,
+      totalPages: 1,
+    },
+  };
 };
 
 export const getConversationMessages = async (phone: string): Promise<ChatMessage[]> => {
@@ -193,6 +248,10 @@ export const resolvePendingMessage = async (phone: string, message_id: string): 
   await api.post("/messages/resolve-pending", { phone, message_id });
 };
 
+export const resolvePendingMessages = async (phone: string, message_ids: string[] = []): Promise<void> => {
+  await api.post("/messages/resolve-pending/bulk", { phone, message_ids });
+};
+
 export const deleteMessageForMe = async (phone: string, message_id: string): Promise<void> => {
   await api.post("/messages/delete-for-me", { phone, message_id });
 };
@@ -204,6 +263,63 @@ export const deleteMessageForAll = async (phone: string, message_id: string): Pr
 export const editMessage = async (phone: string, message_id: string, text: string): Promise<ChatMessage> => {
   const { data } = await api.post("/messages/edit", { phone, message_id, text });
   return mapChatMessage(data.data);
+};
+
+// AI Trace
+export const getAiTraceRuns = async (limit = 50): Promise<AiTraceRun[]> => {
+  const { data } = await api.get("/ai/runs", { params: { limit } });
+  return data.data;
+};
+
+export const getAiTraceRun = async (runId: string): Promise<AiTraceRun> => {
+  const { data } = await api.get(`/ai/runs/${encodeURIComponent(runId)}`);
+  return data.data;
+};
+
+// Customers
+export const getCustomerOrders = async (
+  params: { search?: string; page?: number; limit?: number } = {}
+): Promise<{ data: CustomerOrder[]; meta: CustomerOrderMeta }> => {
+  const { data } = await api.get("/customers", { params });
+  return {
+    data: data.data.map(mapCustomerOrder),
+    meta: data.meta,
+  };
+};
+
+export const updateCustomerOrder = async (
+  id: string,
+  payload: Partial<Pick<CustomerOrder, "nama" | "nama_toko" | "alamat" | "no_hp" | "orderan">>
+): Promise<CustomerOrder> => {
+  const { data } = await api.put(`/customers/${id}`, payload);
+  return mapCustomerOrder(data.data);
+};
+
+export const deleteCustomerOrder = async (id: string): Promise<void> => {
+  await api.delete(`/customers/${id}`);
+};
+
+// Demo Requests
+export const getDemoRequests = async (
+  params: { search?: string; page?: number; limit?: number } = {}
+): Promise<{ data: DemoRequest[]; meta: DemoRequestMeta }> => {
+  const { data } = await api.get("/demo-requests", { params });
+  return {
+    data: data.data.map(mapDemoRequest),
+    meta: data.meta,
+  };
+};
+
+export const updateDemoRequest = async (
+  id: string,
+  payload: Partial<Pick<DemoRequest, "nama" | "nama_toko" | "alamat" | "no_hp" | "demo_program">>
+): Promise<DemoRequest> => {
+  const { data } = await api.put(`/demo-requests/${id}`, payload);
+  return mapDemoRequest(data.data);
+};
+
+export const deleteDemoRequest = async (id: string): Promise<void> => {
+  await api.delete(`/demo-requests/${id}`);
 };
 
 // WhatsApp

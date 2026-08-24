@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { MessageSquare, Reply, BookOpen, Zap, Activity, ArrowUpRight, Wifi } from "lucide-react";
+import { MessageSquare, Reply, BookOpen, Database, Activity, ArrowUpRight, Wifi } from "lucide-react";
 import { getDashboardStats, getWAStatus } from "@/services/api";
 import { StatCard } from "@/components/StatCard";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -57,8 +57,8 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard title="Total Pesan" value={stats?.totalMessages ?? 0} icon={MessageSquare} trend="+12% dari minggu lalu" color="info" />
         <StatCard title="Balas Otomatis" value={stats?.totalAutoReplies ?? 0} icon={Reply} trend="95,3% tingkat respons" />
-        <StatCard title="Total Aturan" value={stats?.totalRules ?? 0} icon={BookOpen} color="accent" />
-        <StatCard title="Aturan Aktif" value={stats?.activeRules ?? 0} icon={Zap} />
+        <StatCard title="Total Knowledge" value={stats?.totalKnowledge ?? 0} icon={BookOpen} color="accent" />
+        <StatCard title="Knowledge Indexed" value={stats?.indexedKnowledge ?? 0} icon={Database} />
       </div>
 
       {waStatus && (

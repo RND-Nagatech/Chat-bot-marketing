@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
+import { useSearchParams } from "react-router-dom";
 import { ChevronDown, ChevronsDown, Image, Search, Send, X } from "lucide-react";
 import {
   editMessage,
@@ -9,6 +10,7 @@ import {
   getConversations,
   getWAStatus,
   resolvePendingMessage,
+  resolvePendingMessages,
   sendManualImageReply,
   sendManualReply,
 } from "@/services/api";
@@ -16,10 +18,38 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Pagination } from "@/components/Pagination";
 import { toast } from "sonner";
-import type { ChatMessage, ConversationSummary, WAStatus } from "@/types";
+import type { ChatMessage, ConversationSummary, PaginationMeta, WAStatus } from "@/types";
+
+function formatLocalPhone(phone: string) {
+  const digits = phone.replace(/\D/g, "");
+  if (digits.startsWith("62")) return `0${digits.slice(2)}`;
+  return phone;
+}
+
+function formatChatDate(value: string) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+
+  return new Intl.DateTimeFormat("id-ID", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
 
 export default function MessagesPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const emptyConversationMeta: PaginationMeta = {
+    page: 1,
+    limit: 10,
+    total: 0,
+    totalPages: 1,
+  };
   const AUTO_REFRESH_OPTIONS = [
     { label: "Off", value: 0 },
     { label: "5 detik", value: 5000 },
@@ -29,6 +59,7 @@ export default function MessagesPage() {
     { label: "2 menit", value: 120000 }
   ];
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [conversationMeta, setConversationMeta] = useState<PaginationMeta>(emptyConversationMeta);
   const [waStatus, setWaStatus] = useState<WAStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -54,6 +85,9 @@ export default function MessagesPage() {
   const [showScrollDownButton, setShowScrollDownButton] = useState(false);
   const [newIncomingCount, setNewIncomingCount] = useState(0);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const [pendingSelectionMode, setPendingSelectionMode] = useState(false);
+  const [selectedPendingIds, setSelectedPendingIds] = useState<Set<string>>(new Set());
+  const [bulkResolving, setBulkResolving] = useState(false);
   const [autoRefreshMs, setAutoRefreshMs] = useState<number>(() => {
     const raw = localStorage.getItem("history_auto_refresh_ms");
     const parsed = Number(raw);
@@ -65,11 +99,22 @@ export default function MessagesPage() {
   const isThreadNearBottomRef = useRef(true);
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
   const hasFocusedPendingRef = useRef(false);
+  const openedFromQueryPhoneRef = useRef<string | null>(null);
 
-  const loadConversations = useCallback(async () => {
-    const data = await getConversations();
-    setConversations(data);
-  }, []);
+  const loadConversations = useCallback(async (options?: { silent?: boolean }) => {
+    if (!options?.silent) {
+      setLoading(true);
+    }
+    try {
+      const { data, meta } = await getConversations({ search, page, limit: rowsPerPage });
+      setConversations(data);
+      setConversationMeta(meta);
+    } finally {
+      if (!options?.silent) {
+        setLoading(false);
+      }
+    }
+  }, [page, rowsPerPage, search]);
 
   const loadWAStatus = useCallback(async () => {
     const status = await getWAStatus();
@@ -91,11 +136,14 @@ export default function MessagesPage() {
   }, []);
 
   useEffect(() => {
-    Promise.all([loadConversations(), loadWAStatus()])
+    const timeout = window.setTimeout(() => {
+      Promise.all([loadConversations(), loadWAStatus()])
       .catch(() => {
         toast.error("Gagal memuat data riwayat chat");
-      })
-      .finally(() => setLoading(false));
+      });
+    }, 250);
+
+    return () => window.clearTimeout(timeout);
   }, [loadConversations, loadWAStatus]);
 
   useEffect(() => {
@@ -104,7 +152,7 @@ export default function MessagesPage() {
     }
 
     const pollId = window.setInterval(() => {
-      void loadConversations();
+      void loadConversations({ silent: true });
       void loadWAStatus();
       if (modalOpen && activePhone) {
         void loadConversationDetail(activePhone, { silent: true });
@@ -126,20 +174,6 @@ export default function MessagesPage() {
     return () => window.clearInterval(swapInterval);
   }, []);
 
-  const filtered = useMemo(() => {
-    const normalizedSearch = search.toLowerCase();
-    return conversations.filter(
-      (c) =>
-        c.phone.includes(search) ||
-        c.last_message.toLowerCase().includes(normalizedSearch)
-    );
-  }, [conversations, search]);
-  const totalPages = Math.max(1, Math.ceil(filtered.length / rowsPerPage));
-  const paginated = useMemo(
-    () => filtered.slice((page - 1) * rowsPerPage, page * rowsPerPage),
-    [filtered, page, rowsPerPage]
-  );
-
   const openConversation = async (phone: string) => {
     setActivePhone(phone);
     setModalOpen(true);
@@ -153,6 +187,9 @@ export default function MessagesPage() {
     setShowScrollDownButton(false);
     setNewIncomingCount(0);
     setHighlightedMessageId(null);
+    setPendingSelectionMode(false);
+    setSelectedPendingIds(new Set());
+    setBulkResolving(false);
     setHoveredMessageId(null);
     setOpenActionMessageId(null);
     setActionRehoverLockMessageId(null);
@@ -166,6 +203,22 @@ export default function MessagesPage() {
       toast.error("Gagal memuat detail percakapan");
     }
   };
+
+  useEffect(() => {
+    const queryPhone = searchParams.get("phone");
+    if (!queryPhone || openedFromQueryPhoneRef.current === queryPhone) {
+      return;
+    }
+
+    openedFromQueryPhoneRef.current = queryPhone;
+    void openConversation(queryPhone).finally(() => {
+      setSearchParams((current) => {
+        const next = new URLSearchParams(current);
+        next.delete("phone");
+        return next;
+      }, { replace: true });
+    });
+  }, [searchParams, setSearchParams]);
 
   const refreshThreadAndList = useCallback(async () => {
     if (!activePhone) return;
@@ -371,6 +424,92 @@ export default function MessagesPage() {
     });
   }, [pendingOnly, threadMessages, threadSearch]);
 
+  const pendingThreadMessages = useMemo(
+    () => threadMessages.filter((message) => message.direction === "inbound" && message.follow_up_state === "open"),
+    [threadMessages]
+  );
+
+  const visiblePendingMessages = useMemo(
+    () => displayedThreadMessages.filter((message) => message.direction === "inbound" && message.follow_up_state === "open"),
+    [displayedThreadMessages]
+  );
+
+  const selectedPendingMessages = useMemo(
+    () => pendingThreadMessages.filter((message) => selectedPendingIds.has(message.id)),
+    [pendingThreadMessages, selectedPendingIds]
+  );
+
+  const allVisiblePendingSelected = visiblePendingMessages.length > 0
+    && visiblePendingMessages.every((message) => selectedPendingIds.has(message.id));
+
+  const togglePendingSelection = (messageId: string, checked: boolean) => {
+    setSelectedPendingIds((current) => {
+      const next = new Set(current);
+      if (checked) {
+        next.add(messageId);
+      } else {
+        next.delete(messageId);
+      }
+      return next;
+    });
+  };
+
+  const toggleVisiblePendingSelection = (checked: boolean) => {
+    setSelectedPendingIds((current) => {
+      const next = new Set(current);
+      visiblePendingMessages.forEach((message) => {
+        if (checked) {
+          next.add(message.id);
+        } else {
+          next.delete(message.id);
+        }
+      });
+      return next;
+    });
+  };
+
+  const handleResolvePendingBulk = async (mode: "selected" | "all") => {
+    if (!activePhone || bulkResolving) return;
+
+    const selectedSourceIds = selectedPendingMessages.map((message) => message.source_message_id || message.id);
+    if (mode === "selected" && selectedSourceIds.length === 0) {
+      toast.error("Pilih pesan pending dulu");
+      return;
+    }
+    if (mode === "all" && pendingThreadMessages.length === 0) {
+      toast.error("Tidak ada pesan pending");
+      return;
+    }
+
+    setBulkResolving(true);
+    try {
+      await resolvePendingMessages(activePhone, mode === "selected" ? selectedSourceIds : []);
+      setSelectedPendingIds(new Set());
+      setPendingSelectionMode(false);
+      setReplyTarget((current) => (
+        current && (mode === "all" || selectedPendingIds.has(current.id)) ? null : current
+      ));
+      setEditTarget((current) => (
+        current && (mode === "all" || selectedPendingIds.has(current.id)) ? null : current
+      ));
+      await refreshThreadAndList();
+      toast.success(mode === "selected" ? "Status pending terpilih diselesaikan" : "Semua status pending diselesaikan");
+    } catch (error: any) {
+      toast.error(error?.response?.data?.message || "Gagal menyelesaikan status pending");
+    } finally {
+      setBulkResolving(false);
+    }
+  };
+
+  useEffect(() => {
+    setSelectedPendingIds((current) => {
+      if (current.size === 0) return current;
+      const pendingIds = new Set(pendingThreadMessages.map((message) => message.id));
+      const next = new Set([...current].filter((id) => pendingIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [pendingThreadMessages]);
+
   useEffect(() => {
     if (!modalOpen || hasFocusedPendingRef.current || !threadContainerRef.current) return;
 
@@ -443,13 +582,7 @@ export default function MessagesPage() {
 
   useEffect(() => {
     setPage(1);
-  }, [rowsPerPage, search]);
-
-  useEffect(() => {
-    if (page > totalPages) {
-      setPage(totalPages);
-    }
-  }, [page, totalPages]);
+  }, [rowsPerPage]);
 
   useEffect(() => {
     const textarea = composerTextareaRef.current;
@@ -516,32 +649,14 @@ export default function MessagesPage() {
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
         <input
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e) => {
+            setPage(1);
+            setSearch(e.target.value);
+          }}
           placeholder="Cari nomor atau pesan terakhir..."
           className="w-full sm:w-72 rounded-lg border bg-card pl-9 pr-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
         />
       </div>
-
-      {filtered.length > rowsPerPage && (
-        <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="text-sm text-muted-foreground">
-            Menampilkan {filtered.length === 0 ? 0 : (page - 1) * rowsPerPage + 1}-
-            {Math.min(page * rowsPerPage, filtered.length)} dari {filtered.length} percakapan
-          </div>
-          <div className="flex items-center gap-2">
-            <label className="text-sm text-muted-foreground">Per halaman</label>
-            <select
-              value={rowsPerPage}
-              onChange={(e) => setRowsPerPage(Number(e.target.value))}
-              className="rounded-lg border bg-card px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
-            >
-              <option value={5}>5</option>
-              <option value={10}>10</option>
-              <option value={20}>20</option>
-            </select>
-          </div>
-        </div>
-      )}
 
       {loading ? (
         <div className="flex items-center justify-center h-40">
@@ -560,13 +675,13 @@ export default function MessagesPage() {
                 </tr>
               </thead>
               <tbody>
-                {paginated.map((conversation) => (
+                {conversations.map((conversation) => (
                   <tr
                     key={conversation.phone}
                     onClick={() => void openConversation(conversation.phone)}
                     className="border-b last:border-0 hover:bg-muted/30 transition-colors cursor-pointer"
                   >
-                    <td className="px-4 py-3 font-mono text-foreground text-xs">{conversation.phone}</td>
+                    <td className="px-4 py-3 font-mono text-foreground text-xs">{formatLocalPhone(conversation.phone)}</td>
                     <td className="px-4 py-3 text-foreground max-w-xs">
                       <div className="rounded-lg bg-muted px-3 py-1.5 inline-block text-sm">
                         {conversation.last_message || "-"}
@@ -586,38 +701,27 @@ export default function MessagesPage() {
                       })()}
                     </td>
                     <td className="px-4 py-3 text-muted-foreground text-xs whitespace-nowrap">
-                      {new Date(conversation.last_message_at).toLocaleString()}
+                      {formatChatDate(conversation.last_message_at)}
                     </td>
                   </tr>
                 ))}
-                {paginated.length === 0 && (
+                {conversations.length === 0 && (
                   <tr><td colSpan={4} className="px-4 py-8 text-center text-muted-foreground">Tidak ada percakapan</td></tr>
                 )}
               </tbody>
             </table>
           </div>
-        </div>
-      )}
-
-      {filtered.length > rowsPerPage && (
-        <div className="mt-4 flex items-center justify-end gap-2">
-          <button
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
-            disabled={page === 1}
-            className="rounded-lg border px-3 py-1.5 text-sm text-muted-foreground disabled:opacity-50 hover:bg-muted transition-colors"
-          >
-            Sebelumnya
-          </button>
-          <span className="text-sm text-muted-foreground">
-            Halaman {page} / {totalPages}
-          </span>
-          <button
-            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-            disabled={page === totalPages}
-            className="rounded-lg border px-3 py-1.5 text-sm text-muted-foreground disabled:opacity-50 hover:bg-muted transition-colors"
-          >
-            Berikutnya
-          </button>
+          <Pagination
+            page={conversationMeta.page}
+            totalPages={conversationMeta.totalPages}
+            pageSize={rowsPerPage}
+            disabled={loading}
+            onPageChange={setPage}
+            onPageSizeChange={(nextLimit) => {
+              setRowsPerPage(nextLimit);
+              setPage(1);
+            }}
+          />
         </div>
       )}
 
@@ -639,6 +743,9 @@ export default function MessagesPage() {
             setShowScrollDownButton(false);
             setNewIncomingCount(0);
             setHighlightedMessageId(null);
+            setPendingSelectionMode(false);
+            setSelectedPendingIds(new Set());
+            setBulkResolving(false);
             setHoveredMessageId(null);
             setOpenActionMessageId(null);
             setActionRehoverLockMessageId(null);
@@ -657,7 +764,7 @@ export default function MessagesPage() {
           </DialogHeader>
 
           <div className="px-6 py-3 border-b bg-background">
-            <div className="flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between">
+            <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
               <div className="relative w-full sm:max-w-xs">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                 <input
@@ -667,16 +774,69 @@ export default function MessagesPage() {
                   className="w-full rounded-lg border bg-card pl-9 pr-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
                 />
               </div>
-              <button
-                onClick={() => setPendingOnly((prev) => !prev)}
-                className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
-                  pendingOnly
-                    ? "border-amber-300 bg-amber-50 text-amber-700"
-                    : "text-muted-foreground hover:bg-muted"
-                }`}
-              >
-                {pendingOnly ? "Tampilkan Semua" : "Filter Pending Saja"}
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                {!pendingSelectionMode ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPendingSelectionMode(true);
+                      setPendingOnly(true);
+                    }}
+                    disabled={pendingThreadMessages.length === 0 || bulkResolving}
+                    className="inline-flex items-center rounded-lg border bg-card px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Pilih Pesan
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => toggleVisiblePendingSelection(!allVisiblePendingSelected)}
+                      disabled={visiblePendingMessages.length === 0 || bulkResolving}
+                      className="inline-flex items-center rounded-lg border bg-card px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {allVisiblePendingSelected ? "Batal Pilih Semua" : "Pilih Semua"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleResolvePendingBulk("selected")}
+                      disabled={selectedPendingMessages.length === 0 || bulkResolving}
+                      className="inline-flex items-center rounded-lg border border-primary/30 bg-primary/10 px-3 py-2 text-sm font-medium text-primary transition-colors hover:bg-primary/15 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {bulkResolving ? "Memproses..." : `Selesaikan Dipilih (${selectedPendingMessages.length})`}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPendingSelectionMode(false);
+                        setSelectedPendingIds(new Set());
+                      }}
+                      disabled={bulkResolving}
+                      className="inline-flex items-center rounded-lg border bg-card px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Batal
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void handleResolvePendingBulk("all")}
+                  disabled={pendingThreadMessages.length === 0 || bulkResolving}
+                  className="inline-flex items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-700 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Selesaikan Semua Pending
+                </button>
+                <button
+                  onClick={() => setPendingOnly((prev) => !prev)}
+                  className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                    pendingOnly
+                      ? "border-amber-300 bg-amber-50 text-amber-700"
+                      : "text-muted-foreground hover:bg-muted"
+                  }`}
+                >
+                  {pendingOnly ? "Tampilkan Semua" : "Filter Pending Saja"}
+                </button>
+              </div>
             </div>
           </div>
 
@@ -725,8 +885,22 @@ export default function MessagesPage() {
                     <div
                       key={message.id}
                       data-message-id={message.id}
-                      className={`flex ${isOutbound ? "justify-end" : "justify-start"}`}
+                      className={`flex items-start gap-2 ${isOutbound ? "justify-end" : "justify-start"}`}
                     >
+                      {pendingSelectionMode && isPending && (
+                        <label
+                          className="mt-2 inline-flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full border border-amber-300 bg-amber-50 text-amber-700 transition-colors hover:bg-amber-100"
+                          title="Pilih pesan pending"
+                          aria-label="Pilih pesan pending"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selectedPendingIds.has(message.id)}
+                            onChange={(event) => togglePendingSelection(message.id, event.target.checked)}
+                            className="h-4 w-4 rounded border-amber-300 accent-primary"
+                          />
+                        </label>
+                      )}
                       <div
                         className="group/message relative max-w-[75%]"
                         onMouseEnter={() => {
@@ -789,6 +963,16 @@ export default function MessagesPage() {
                             </div>
                           ) : (
                             <div className="whitespace-pre-wrap break-words">{message.text}</div>
+                          )}
+                          {isPending && (message.follow_up_reason || message.follow_up_summary) && (
+                            <div className="mt-2 rounded-lg bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
+                              {message.follow_up_reason && (
+                                <div className="font-medium">{message.follow_up_reason}</div>
+                              )}
+                              {message.follow_up_summary && (
+                                <div className="mt-0.5 opacity-80">{message.follow_up_summary}</div>
+                              )}
+                            </div>
                           )}
                           <div className="mt-1 text-[11px] opacity-75 text-right">
                             {new Date(message.timestamp).toLocaleTimeString()}
